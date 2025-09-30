@@ -13,6 +13,12 @@
 
 */
 
+#if defined(__APPLE__)
+  #define WEAKSYM __attribute__((weak_import))
+#else
+  #define WEAKSYM __attribute__((weak))
+#endif
+
 #ifdef __linux__
   #ifndef _GNU_SOURCE
     #define _GNU_SOURCE
@@ -29,9 +35,8 @@
   #endif
   #include <dlfcn.h>
 
-__attribute__((weak)) void __sanitizer_symbolize_pc(void *, const char *fmt,
-                                                    char  *out_buf,
-                                                    size_t out_buf_size);
+WEAKSYM void __sanitizer_symbolize_pc(void *, const char *fmt, char *out_buf,
+                                      size_t out_buf_size);
 #endif
 
 #ifdef __ANDROID__
@@ -128,12 +133,12 @@ static u8  __afl_area_initial[MAP_INITIAL_SIZE];
 static u8 *__afl_area_ptr_dummy = __afl_area_initial;
 static u8 *__afl_area_ptr_backup = __afl_area_initial;
 
-u8        *__afl_area_ptr = __afl_area_initial;
-u8        *__afl_dictionary;
-u8        *__afl_fuzz_ptr;
-static u32 __afl_fuzz_len_dummy;
-u32       *__afl_fuzz_len = &__afl_fuzz_len_dummy;
-int        __afl_sharedmem_fuzzing __attribute__((weak));
+u8                         *__afl_area_ptr = __afl_area_initial;
+u8                         *__afl_dictionary;
+u8                         *__afl_fuzz_ptr;
+static u32                  __afl_fuzz_len_dummy;
+u32                        *__afl_fuzz_len = &__afl_fuzz_len_dummy;
+int __afl_sharedmem_fuzzing WEAKSYM;
 
 u32 __afl_final_loc;
 u32 __afl_map_size = MAP_SIZE;
@@ -150,9 +155,9 @@ u8 __afl_forkserver_setenv = 0;
 static u64 __afl_ijon_initial[MAP_SIZE_IJON_ENTRIES];
 u64 *__afl_ijon_bits = __afl_ijon_initial;  // Initial buffer, will point to
                                             // shared memory at MAP_SIZE offset
-u32        __afl_ijon_map_size = MAP_SIZE_IJON_ENTRIES;
-u32        __afl_ijon_map_increased = 0;
-extern int __afl_ijon_enabled __attribute__((weak));
+u32 __afl_ijon_map_size = MAP_SIZE_IJON_ENTRIES;
+u32 __afl_ijon_map_increased = 0;
+int __afl_ijon_enabled;
 
 /* IJON state tracking globals */
 #if defined(__ANDROID__) || defined(__HAIKU__) || defined(NO_TLS)
@@ -217,9 +222,9 @@ u8            *__afl_filter_pcs_module = NULL;
 u32 __afl_connected = 0;
 
 // for the __AFL_COVERAGE_ON/__AFL_COVERAGE_OFF features to work:
-int        __afl_selective_coverage __attribute__((weak));
-int        __afl_selective_coverage_start_off __attribute__((weak));
-static int __afl_selective_coverage_temp = 1;
+int __afl_selective_coverage           WEAKSYM;
+int __afl_selective_coverage_start_off WEAKSYM;
+static int                             __afl_selective_coverage_temp = 1;
 
 #if defined(__ANDROID__) || defined(__HAIKU__) || defined(NO_TLS)
 PREV_LOC_T __afl_prev_loc[NGRAM_SIZE_MAX];
@@ -257,7 +262,7 @@ static u8 _is_sancov;
 
 u32 __afl_already_initialized_shm;
 u32 __afl_already_initialized_forkserver;
-u32 __afl_already_initialized_first;
+// u32 __afl_already_initialized_first;
 u32 __afl_already_initialized_second;
 u32 __afl_already_initialized_early;
 u32 __afl_already_initialized_init;
@@ -279,6 +284,38 @@ static void at_exit(int signal) {
   }
 
   _exit(0);
+
+}
+
+#if defined(__APPLE__)
+__attribute__((section("__DATA,__afl_ijon"),
+               used)) static const char __afl_ijon_anchor_start = 0;
+
+__attribute__((section("__DATA,__afl_ijon"),
+               used)) static const char __afl_ijon_anchor_end = 0;
+#else
+__attribute__((section("__afl_ijon"),
+               used)) static const char __afl_ijon_anchor_start = 0;
+
+__attribute__((section("__afl_ijon"),
+               used)) static const char __afl_ijon_dummy = 0;
+
+__attribute__((section("__afl_ijon"),
+               used)) static const char __afl_ijon_anchor_end = 0;
+#endif
+
+extern const char __afl_ijon_anchor_start;
+extern const char __afl_ijon_anchor_end;
+extern char       __start___afl_ijon[];
+extern char       __stop___afl_ijon[];
+
+int __afl_is_ijon_enabled(void) {
+
+  size_t size = (uintptr_t)&__stop___afl_ijon - (uintptr_t)&__start___afl_ijon;
+  // If only anchors are present, size == 3.
+  // If markers were added, size > 3.
+  // fprintf(stderr, "size=%zu\n", size);
+  return size > 3;
 
 }
 
@@ -415,7 +452,7 @@ static void __afl_map_shm(void) {
   // if we are not running in afl ensure the map exists
   if (!__afl_area_ptr) { __afl_area_ptr = __afl_area_ptr_dummy; }
 
-  if (getenv("AFL_NO_IJON") && &__afl_ijon_enabled) {
+  if (getenv("AFL_NO_IJON")) {
 
     __afl_ijon_enabled = 0;
     __afl_ijon_map_increased = 1;
@@ -428,8 +465,7 @@ static void __afl_map_shm(void) {
 
     __afl_map_size = __afl_final_loc + 1;  // as we count starting 0
 
-    if (&__afl_ijon_enabled != NULL && __afl_ijon_enabled &&
-        !__afl_ijon_map_increased) {
+    if (__afl_ijon_enabled && !__afl_ijon_map_increased) {
 
       __afl_map_size = (((__afl_map_size + 63) >> 6) << 6);
       __afl_cov_map_size = __afl_map_size;
@@ -652,7 +688,7 @@ static void __afl_map_shm(void) {
 
       // IJON SUPPORT: For IJON targets using new forkserver protocol,
       // skip this check as map size is communicated via FS_NEW_OPT_MAPSIZE
-      if (&__afl_ijon_enabled != NULL && __afl_ijon_enabled) {
+      if (__afl_ijon_enabled) {
 
         // Skip the check for IJON targets - let the fuzzer handle validation
         // via forkserver protocol
@@ -1002,15 +1038,14 @@ static void __afl_start_forkserver(void) {
 
   void (*old_sigchld_handler)(int) = signal(SIGCHLD, SIG_DFL);
 
-  if (getenv("AFL_NO_IJON") && &__afl_ijon_enabled) {
+  if (getenv("AFL_NO_IJON")) {
 
     __afl_ijon_enabled = 0;
     __afl_ijon_map_increased = 1;
 
   }
 
-  if (&__afl_ijon_enabled != NULL && __afl_ijon_enabled &&
-      !__afl_ijon_map_increased) {
+  if (__afl_ijon_enabled && !__afl_ijon_map_increased) {
 
     __afl_map_size = (((__afl_map_size + 63) >> 6) << 6);
     __afl_cov_map_size = __afl_map_size;
@@ -1052,20 +1087,9 @@ static void __afl_start_forkserver(void) {
   // return because possible non-forkserver usage
   if (write(FORKSRV_FD + 1, msg, 4) != 4) {
 
-    if (&__afl_ijon_enabled != NULL) {
-
-      __afl_ijon_enabled = 0;
-      __afl_ijon_map_increased = 1;
-
-    }
-
+    __afl_ijon_enabled = 0;
+    __afl_ijon_map_increased = 1;
     return;
-
-  }
-
-  if (&__afl_ijon_enabled != NULL && !__afl_ijon_map_increased) {
-
-    __afl_ijon_enabled = 1;
 
   }
 
@@ -1089,11 +1113,7 @@ static void __afl_start_forkserver(void) {
     }
 
     /* Add IJON capability flag if IJON is enabled */
-    if (&__afl_ijon_enabled != NULL && __afl_ijon_enabled) {
-
-      status |= FS_OPT_IJON;
-
-    }
+    if (__afl_ijon_enabled) { status |= FS_OPT_IJON; }
 
     if (write(FORKSRV_FD + 1, msg, 4) != 4) {
 
@@ -1497,6 +1517,8 @@ __attribute__((constructor(1))) void __afl_auto_second(void) {
   if (__afl_already_initialized_second) return;
   __afl_already_initialized_second = 1;
 
+  __afl_ijon_enabled = __afl_is_ijon_enabled();
+
   if (getenv("AFL_DEBUG")) {
 
     __afl_debug = 1;
@@ -1537,6 +1559,7 @@ __attribute__((constructor(1))) void __afl_auto_second(void) {
 /* preset __afl_area_ptr #1 - at constructor level 0 global variables have
    not been set */
 
+/*
 __attribute__((constructor(0))) void __afl_auto_first(void) {
 
   if (__afl_already_initialized_first) return;
@@ -1544,19 +1567,9 @@ __attribute__((constructor(0))) void __afl_auto_first(void) {
 
   if (getenv("AFL_DISABLE_LLVM_INSTRUMENTATION")) return;
 
-  /*
-    u8 *ptr = (u8 *)malloc(MAP_INITIAL_SIZE);
-
-    if (ptr && (ssize_t)ptr != -1) {
-
-      __afl_area_ptr = ptr;
-      __afl_area_ptr_backup = __afl_area_ptr;
-
-    }
-
-  */
-
 }  // ptr memleak report is a false positive
+
+*/
 
 /* The following stuff deals with supporting -fsanitize-coverage=trace-pc-guard.
    It remains non-operational in the traditional, plugin-backed LLVM mode.
@@ -1931,7 +1944,7 @@ void __sanitizer_cov_trace_pc_guard_init(uint32_t *start, uint32_t *stop) {
 
   if (!getenv("AFL_DUMP_MAP_SIZE")) {
 
-    __afl_auto_first();
+    //__afl_auto_first();
     __afl_auto_second();
     __afl_auto_early();
 
@@ -2130,7 +2143,7 @@ void __sanitizer_cov_trace_pc_guard_init(uint32_t *start, uint32_t *stop) {
 
   /*
   // IJON SUPPORT: Apply deferred IJON expansion now that __afl_final_loc is
-  known if (&__afl_ijon_enabled != NULL && __afl_ijon_enabled && __afl_final_loc
+  known if (__afl_ijon_enabled && __afl_final_loc
   > 0) { u32 coverage_size = __afl_final_loc + 1;
 
     // If we're still using the default MAP_SIZE, update to actual coverage +
@@ -2163,8 +2176,7 @@ void __sanitizer_cov_trace_pc_guard_init(uint32_t *start, uint32_t *stop) {
     __afl_map_size = __afl_final_loc + 1;
 
     // IJON SUPPORT: Re-apply IJON expansion after reinit
-    if (&__afl_ijon_enabled != NULL && __afl_ijon_enabled &&
-        !__afl_ijon_map_increased) {
+    if (__afl_ijon_enabled && !__afl_ijon_map_increased) {
 
       __afl_map_size = (((__afl_map_size + 63) >> 6) << 6);
       __afl_cov_map_size = __afl_map_size;
@@ -2530,7 +2542,7 @@ void __sanitizer_cov_trace_switch(uint64_t val, uint64_t *cases) {
 
 }
 
-__attribute__((weak)) void *__asan_region_is_poisoned(void *beg, size_t size) {
+WEAKSYM void *__asan_region_is_poisoned(void *beg, size_t size) {
 
   return NULL;
 
