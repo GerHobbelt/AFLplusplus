@@ -464,8 +464,8 @@ typedef struct afl_env_vars {
       afl_no_startup_calibration, afl_no_warn_instability,
       afl_post_process_keep_original, afl_crashing_seeds_as_new_crash,
       afl_final_sync, afl_ignore_seed_problems, afl_disable_redundant,
-      afl_sha1_filenames, afl_no_sync, afl_no_fastresume, afl_forksrv_uid_set,
-      afl_forksrv_gid_set;
+      afl_sha1_filenames, afl_no_sync, afl_no_fastresume, afl_force_fastresume,
+      afl_forksrv_uid_set, afl_forksrv_gid_set;
 
   u16 afl_forksrv_nb_supl_gids;
 
@@ -509,6 +509,10 @@ typedef struct afl_state {
   sharedmem_t      shm;
   sharedmem_t     *shm_fuzz;
   afl_env_vars_t   afl_env;
+#ifdef __AFL_CODE_COVERAGE
+  sharedmem_t shm_pcmap;                         /* Shared memory for pcmap */
+  sharedmem_t shm_modmap;                       /* Shared memory for modmap */
+#endif
 
   char **argv;                                            /* argv if needed */
 
@@ -1244,6 +1248,14 @@ u8 save_if_interesting(afl_state_t *, void *, u32, u8);
 u8 has_new_bits(afl_state_t *, u8 *);
 #ifndef AFL_SHOWMAP
 void classify_counts(afl_forkserver_t *);
+#endif
+
+#ifdef __AFL_CODE_COVERAGE
+void afl_pcmap_init(afl_state_t *, u32);
+void afl_pcmap_resize(afl_state_t *, u32);
+void afl_modmap_init(afl_state_t *);
+void afl_dump_pc_map(afl_state_t *);
+void afl_dump_module_map(afl_state_t *);
 #endif
 
 /* Extras */

@@ -4,14 +4,12 @@
 
  - afl_fsrv_deinit cmplog
  - ijon support?
- - check for null ptr for xml/curl/g_ string transform functions
  - hardened_usercopy=0 page_alloc.shuffle=0
  - add value_profile but only enable after 15 minutes without finds
  - cmplog max items env?
  - adapt MOpt to new mutation engine
    - Update afl->pending_not_fuzzed for MOpt
  - cmplog rtn sanity check on fixed length? currently we ignore the length
- - afl-showmap -f support
  - afl-fuzz multicore wrapper script
  - when trimming then perform crash detection
 
