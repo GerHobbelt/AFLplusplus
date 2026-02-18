@@ -276,6 +276,10 @@ void afl_fsrv_init(afl_forkserver_t *fsrv) {
   fsrv->nyx_tmp_workdir_path = NULL;
   fsrv->nyx_log_fd = -1;
   fsrv->nyx_target_hash64 = 0;
+
+  fsrv->gui_mode = 0;
+  fsrv->gui_python_dir = NULL;
+  fsrv->gui_python_pid = -1;
 #endif
 
   // this structure needs default so we initialize it if this was not done
@@ -324,6 +328,8 @@ void afl_fsrv_init(afl_forkserver_t *fsrv) {
 
   fsrv->uid_set = 0;
   fsrv->gid_set = 0;
+
+  fsrv->perm = DEFAULT_PERMISSION;
 
   fsrv->init_child_func = fsrv_exec_child;
   list_append(&fsrv_list, fsrv);
@@ -1586,9 +1592,18 @@ void afl_fsrv_start(afl_forkserver_t *fsrv, char **argv,
 
       } else {
 
-        // The binary is most likely instrumented using AFL's tool, and we will
-        // set map_size to MAP_SIZE.
-        fsrv->real_map_size = fsrv->map_size = MAP_SIZE;
+        // if AFL_MAP_SIZE is set, use this map size
+        if (getenv("AFL_MAP_SIZE") || getenv("AFL_MAPSIZE")) {
+
+          fsrv->real_map_size = fsrv->map_size = get_map_size();
+
+        } else {
+
+          // Otherwise the binary is most likely instrumented using AFL's tool,
+          // and we will set map_size to MAP_SIZE.
+          fsrv->real_map_size = fsrv->map_size = MAP_SIZE;
+
+        }
 
       }
 
@@ -1825,6 +1840,19 @@ void afl_fsrv_kill(afl_forkserver_t *fsrv) {
 
 #ifdef __linux__
   afl_nyx_runner_kill(fsrv);
+
+  if (fsrv->gui_mode) {
+
+    if (fsrv->gui_python_pid > 0) {
+
+      kill(fsrv->gui_python_pid, fsrv->child_kill_signal);
+
+    }
+
+    fsrv->gui_python_pid = -1;
+
+  }
+
 #endif
 
 }
@@ -2078,6 +2106,33 @@ fsrv_run_result_t __attribute__((hot)) afl_fsrv_run_target(
 
   }
 
+  // GUI Mode
+#ifdef __linux__
+  if (unlikely(fsrv->gui_mode)) {
+
+    pid_t python_pid;
+    python_pid = fork();
+
+    if (python_pid < 0) { PFATAL("GUI mode fork failed."); }
+    fsrv->gui_python_pid = python_pid;
+    if (python_pid == 0) {  // child that will perform GUI interactions
+      ACTF("Non-forkserver exec'ing, with PID = %ld\n", (long)getpid());
+      char gui_pid_str[16];
+      sprintf(gui_pid_str, "%d",
+              (int)fsrv->child_pid);  // Convert pid_t to a string
+
+      execl(fsrv->gui_python_dir, fsrv->gui_python_dir, fsrv->out_file,
+            gui_pid_str, NULL);
+
+      PFATAL("execl failed for %s", fsrv->gui_python_dir);
+      exit(1);
+
+    }
+
+  }
+
+#endif
+
 #ifdef AFL_PERSISTENT_RECORD
   // end of persistent loop?
   if (unlikely(fsrv->persistent_record &&
@@ -2215,7 +2270,14 @@ fsrv_run_result_t __attribute__((hot)) afl_fsrv_run_target(
 
   if (unlikely(
           /* A normal crash/abort */
-          (WIFSIGNALED(fsrv->child_status)) ||
+          (WIFSIGNALED(fsrv->child_status)
+  /* Explicitly ignore SIGINT/SIGTERM as a crash, since we use them to terminate
+   * the GUI's*/
+#ifdef __linux__
+           && (!fsrv->gui_mode || (WTERMSIG(fsrv->child_status) != SIGINT &&
+                                   WTERMSIG(fsrv->child_status) != SIGTERM))
+#endif
+               ) ||
           /* special handling for msan */
           ((fsrv->uses_asan & 4) &&
            WEXITSTATUS(fsrv->child_status) == MSAN_ERROR) ||

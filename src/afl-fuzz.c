@@ -121,6 +121,7 @@ static void at_exit() {
   ptr = getenv("__AFL_TARGET_PID2");
   if (ptr && *ptr && (pid2 = atoi(ptr)) > 0) {
 
+    /* cmplog fsrv (pid2) was not deinit'ed, so using getpgid(pid2) is fine. */
     pgrp = getpgid(pid2);
     if (pgrp > 0) { killpg(pgrp, SIGTERM); }
     kill(pid2, SIGTERM);
@@ -130,8 +131,9 @@ static void at_exit() {
   ptr = getenv("__AFL_TARGET_PID1");
   if (ptr && *ptr && (pid1 = atoi(ptr)) > 0) {
 
-    pgrp = getpgid(pid1);
-    if (pgrp > 0) { killpg(pgrp, SIGTERM); }
+    /* forkserver (pid1) was deinit'ed by afl_fsrv_deinit,
+     so getpgid(pid1) would fail; use pid1 directly as pgid. */
+    killpg(pid1, SIGTERM);
     kill(pid1, SIGTERM);
 
   }
@@ -167,8 +169,7 @@ static void at_exit() {
 
   if (pid1 > 0) {
 
-    pgrp = getpgid(pid1);
-    if (pgrp > 0) { killpg(pgrp, kill_signal); }
+    killpg(pid1, kill_signal);
     kill(pid1, kill_signal);
 
   }
@@ -228,6 +229,9 @@ static void usage(u8 *argv0, int more_help) {
 #if defined(__linux__)
       "  -X            - use VM fuzzing (NYX mode - standalone mode)\n"
       "  -Y            - use VM fuzzing (NYX mode - multiple instances mode)\n"
+#endif
+#if defined(__linux__)
+      "  -K dir        - use python script to interact with GUI (GUI mode)\n"
 #endif
       "\n"
 
@@ -669,11 +673,11 @@ int main(int argc, char **argv_orig, char **envp) {
 
   afl->shmem_testcase_mode = 1;  // we always try to perform shmem fuzzing
 
-  // still available: HjJkKqrv
-  while (
-      (opt = getopt(argc, argv,
-                    "+a:Ab:B:c:CdDe:E:f:F:g:G:hi:I:l:L:m:M:nNo:Op:P:QRs:S:t:T:"
-                    "uUV:w:WXx:YzZ")) > 0) {
+  // still available: HjJkqrv
+  while ((opt = getopt(
+              argc, argv,
+              "+a:Ab:B:c:CdDe:E:f:F:g:G:hi:I:K:l:L:m:M:nNo:Op:P:QRs:S:t:T:"
+              "uUV:w:WXx:YzZ")) > 0) {
 
     switch (opt) {
 
@@ -1543,6 +1547,31 @@ int main(int argc, char **argv_orig, char **envp) {
             "(custom_mutators/radamsa/).");
 
         break;
+
+  #ifdef __linux__
+      case 'K':                                                 /* GUI mode */
+        if (afl->fsrv.gui_mode) { FATAL("Multiple -K options not supported"); }
+        if (!optarg || optarg[0] == '-') {
+
+          FATAL(
+              "No directory provided for GUI interaction script. "
+              "Use custom_mutators/guifuzz/guifuzz_clicks.py");
+
+        } else {
+
+          afl->fsrv.gui_python_dir = ck_strdup(optarg);
+          afl->fsrv.gui_mode = 1;
+
+        }
+
+        break;
+
+  #else
+      case 'K':
+        FATAL("GUI mode is only available on linux...");
+        break;
+
+  #endif
 
       default:
         if (!show_help) { show_help = 1; }
@@ -2567,8 +2596,8 @@ int main(int argc, char **argv_orig, char **envp) {
 
   }
 
-  if (afl->non_instrumented_mode || afl->fsrv.qemu_mode ||
-      afl->fsrv.frida_mode || afl->fsrv.cs_mode || afl->unicorn_mode) {
+  if (afl->non_instrumented_mode || afl->fsrv.frida_mode || afl->fsrv.cs_mode ||
+      afl->unicorn_mode) {
 
     map_size = afl->fsrv.real_map_size = afl->fsrv.map_size = MAP_SIZE;
     afl_resize_map_buffers(afl, map_size, MAP_SIZE);
@@ -2581,8 +2610,8 @@ int main(int argc, char **argv_orig, char **envp) {
       afl_shm_init(&afl->shm, afl->fsrv.map_size, afl->non_instrumented_mode,
                    afl->perm, afl->chown_needed ? afl->fsrv.gid : -1);
 
-  if (!afl->non_instrumented_mode && !afl->fsrv.qemu_mode &&
-      !afl->unicorn_mode && !afl->fsrv.frida_mode && !afl->fsrv.cs_mode &&
+  if (!afl->non_instrumented_mode && !afl->unicorn_mode &&
+      !afl->fsrv.frida_mode && !afl->fsrv.cs_mode &&
       !afl->afl_env.afl_skip_bin_check) {
 
     if (map_size <= DEFAULT_SHMEM_SIZE) {
@@ -3118,6 +3147,14 @@ int main(int argc, char **argv_orig, char **envp) {
     afl->q_testcase_cache =
         ck_alloc(afl->q_testcase_max_cache_entries * sizeof(size_t));
     if (!afl->q_testcase_cache) { PFATAL("malloc failed for cache entries"); }
+
+  }
+
+  if (afl->afl_env.afl_sha1_filenames) {
+
+    WARNF(
+        "Using AFL_SHA1_FILENAMES disables any syncing to other AFL "
+        "instances!");
 
   }
 
