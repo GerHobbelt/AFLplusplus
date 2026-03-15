@@ -12,6 +12,7 @@
       (on average) it does nothing, at best it improves time to new coverage
       and total coverage unlocked. https://arxiv.org/pdf/2507.05421
       Thanks to @hgarrereyn for the PR!
+    - Fixed several potential crashes when using IJON
     - added `AFL_FORCE_FASTRESUME` which will ignore the saved hash of the
       target - but note it will only work if the coverage map size did not
       change
@@ -24,8 +25,10 @@
     - marked GCC plugins as unmaintained. We need someone who know gimple and
       is willing to fix the plugin issues, workarounds for gcc bugs and
       overall improve the plugin.
+    - optimize hidden CFG instrumentation (don't instrument vector selects)
   - afl-cmin:
-    - new implementation in C by @kcwu - thanks! (it is the default now)
+    - new implementation in C by @kcwu - it is currenlty not built though
+      because of maturity reasons
     - afl-cmin.py was changing behaviour to hash the original filenames,
       this was reverted.
     - afl-cmin and afl-cmin.py honor `AFL_SHA1_FILENAMES` now
