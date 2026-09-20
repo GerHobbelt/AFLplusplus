@@ -178,6 +178,66 @@ Available options:
   - NGRAM-x - deeper previous location coverage (from NGRAM-2 up to NGRAM-16)
   - PCGUARD - our own pcguard based instrumentation (default)
 
+#### Bug-pass oracles
+
+Setting any `AFL_LLVM_BUG*` variable during compilation enables
+`afl-llvm-bug-pass.so`, which adds runtime oracles for arithmetic-bound and
+logical-OOB bugs that ASan does not catch (the CVE-2023-4863 / libwebp-Huffman
+class).
+
+  - `AFL_LLVM_BUG=1` — enable all bug-pass oracles (shorthand for setting all
+    three sub-modes below).
+  - `AFL_LLVM_BUG_SCALAR=1` — max-value-per-arithmetic-site coverage and
+    per-loop iteration counts. Treats internal scalar growth as a fitness
+    signal in addition to edge coverage. Useful for finding inputs that
+    drive computed sizes/lengths to corner cases.
+  - `AFL_LLVM_BUG_BUDGET=1` — at every call site of the form `ptr += func()`
+    (or `ptr = gep(ptr, func())`), enforce that during the call all writes
+    via the pointer arg lie in `[ptr, ptr + return_value)`. Catches functions
+    that write beyond what they claim to consume.
+  - `AFL_LLVM_BUG_SIZEFILL=1` — at every call site to a function that has a
+    "NULL-means-size-only" sentinel parameter, verify the returned size and
+    actual writes both fit the caller's known buffer.
+  - `AFL_LLVM_BUG_ALLOCSIZE` — enable the AllocSizeOracle pass: every call to
+    `malloc`, `calloc`, `realloc`, `posix_memalign`, and `free` is rewritten
+    to a tracked variant that records `(base, size, alloc_site_id)` in a
+    runtime shadow table. Every store inside a loop whose pointer base
+    traces back to a tracked allocation emits one runtime hook with three
+    feedback channels:
+      1. **Headroom** (max-rule) — `__afl_bug_map[hash(site)]` holds the
+         highest "closeness to end" seen across the run, so the fuzzer
+         rewards inputs that approach but don't yet exceed the buffer.
+      2. **Proximity bucket** — a synthetic edge `hash(site, log2(remaining))`
+         joining the bug-map; turns "wrote into the last 8/16/32/… bytes
+         of buffer X" into a discoverable coverage event.
+      3. **Soft-OOB tripwire** — `abort()`s with a diagnostic when an
+         in-loop store hits or exceeds the recorded end, before ASan's
+         shadow check would (useful for custom allocators ASan doesn't
+         poison).
+    Cost is one shadow lookup + one subtract + 2–3 max-rule writes per
+    qualifying store. Combine with `AFL_LLVM_BUG_BUDGET=1` and
+    `AFL_LLVM_BUG_SIZEFILL=1` to layer all four oracles.
+  - `AFL_LLVM_BUG_ALLOCSIZE_FUNCS` — comma-separated list of custom
+    allocator function names that the pass should treat as additional
+    allocator entry points (e.g., `WebPSafeMalloc,WebPSafeCalloc`). The
+    pass inserts a post-call `__afl_alloc_register` and uses the first
+    integer argument of the callee as the size. Pair with
+    `AFL_LLVM_BUG_ALLOCSIZE=1`. Note: targets must export the named
+    function (non-static / extern linkage) so LLVM's IPO does not strip
+    the size argument; static helpers can be specialized away by `-O3`.
+  - `AFL_LLVM_BUG_ALLOCSIZE_DERIVE` — at every `__afl_alloc_unregister`
+    (free of a tracked allocation), log `(record.size,
+    record.max_observed_off)` into a CmpLog routine slot keyed by
+    alloc-site ID. Requires `AFL_LLVM_BUG_ALLOCSIZE=1` and a CmpLog
+    binary (or `AFL_CMPLOG_DEBUG=1`) for the cmp_map to be allocated.
+    Pair with `afl-fuzz -l 2z` to confirm the feature is in use; the
+    fuzzer's existing CmpLog RTN dictionary mining harvests the entries
+    automatically.
+
+The runtime keeps its own private max-value bug-map (`MAP_SIZE_BUG`,
+16384 u32 slots), separate from the IJON map, and reports oracle violations
+to stderr followed by `abort()`.
+
 #### CMPLOG
 
 Setting `AFL_LLVM_CMPLOG=1` during compilation will tell afl-clang-fast to
@@ -668,6 +728,11 @@ checks or alter some of the more exotic semantics of the tool:
 
   - Setting `AFL_TRY_AFFINITY` tries to attempt binding to a specific CPU core
     on Linux systems, but will not terminate if that fails.
+
+  - By default on Linux, persistent mode uses shared memory and futexes for
+    child synchronization. This reduces the overhead of communication between
+    afl-fuzz and the persistent target child. Setting `AFL_OLD_CHILD_SYNC`
+    restores the old file descriptor based persistent synchronization behavior.
 
   - The following environment variables are only needed if you implemented
     your own forkserver or persistent mode, or if __AFL_LOOP or __AFL_INIT

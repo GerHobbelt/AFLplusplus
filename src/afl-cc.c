@@ -2467,7 +2467,14 @@ void add_lto_linker(aflcc_state_t *aflcc) {
 
     }
 
+    /* On macOS the Mach-O lld backend is named ld64.lld; ld.lld is ELF only
+       and rejects the Mach-O flags clang emits (-arch, -platform_version,
+       -syslibroot, ...). */
+#ifdef __APPLE__
+    ld_path = strdup("ld64.lld");
+#else
     ld_path = strdup("ld.lld");
+#endif
 
   }
 
@@ -2587,6 +2594,12 @@ void add_runtime(aflcc_state_t *aflcc) {
       insert_param(aflcc, "-Wl,___sanitizer_cov_trace_pc_guard_init");
 
     }
+
+    /* afl-compiler-rt.o weakly references __asan_region_is_poisoned; on
+       Mach-O the linker still requires resolution unless explicitly told
+       the symbol may be missing at runtime. */
+    insert_param(aflcc, "-Wl,-U");
+    insert_param(aflcc, "-Wl,___asan_region_is_poisoned");
 
   #endif
 
@@ -3735,6 +3748,16 @@ static void edit_params(aflcc_state_t *aflcc, u32 argc, char **argv,
 
       load_llvm_pass(aflcc, "cmplog-instructions-pass.so");
       load_llvm_pass(aflcc, "cmplog-routines-pass.so");
+
+    }
+
+    /* Bug-finding pass: enabled by any AFL_LLVM_BUG* var. Single .so handles
+       all five sub-modes internally (SCALAR/BUDGET/SIZEFILL/ALLOCSIZE/SLACK). */
+    if (getenv("AFL_LLVM_BUG") || getenv("AFL_LLVM_BUG_SCALAR") ||
+        getenv("AFL_LLVM_BUG_BUDGET") || getenv("AFL_LLVM_BUG_SIZEFILL") ||
+        getenv("AFL_LLVM_BUG_ALLOCSIZE") || getenv("AFL_LLVM_BUG_SLACK")) {
+
+      load_llvm_pass(aflcc, "afl-llvm-bug-pass.so");
 
     }
 

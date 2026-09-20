@@ -5,6 +5,12 @@
 
 
 ### Version ++4.41a (dev)
+  - Switched https://github.com/AFLplusplus/cov-analysis for outdated afl-cov
+  - MacOS most current version support for afl-fuzz, afl-cc (incl. LTO) and
+    frida mode
+  - Linux persistent mode uses futex now which increases speed and reduces
+    system call overhead (opt out with AFL_FAST_CHILD_SYNC), thanks to
+    @martinus for most of the implementation!
   - afl-fuzz:
     - `-I tool` call now receives the new crash as a command line parameter
     - changed to a better map classifier
@@ -13,6 +19,35 @@
   - afl-cc:
     - Fixes in the PCGUARD and LTO instrumentation that could lead to sanitizer
       triggers in target binaries
+    - new instrumentation: `afl-llvm-bug-pass.so` provides three runtime
+      oracles for arithmetic-bound and logical-OOB bugs that ASan misses
+      (CVE-2023-4863 / libwebp-Huffman class):
+        * `AFL_LLVM_BUG_SCALAR=1`   - max-value-per-arithmetic-site coverage,
+                                      plus per-loop iteration count
+        * `AFL_LLVM_BUG_BUDGET=1`   - check `ptr += func()` write-extent
+                                      contract
+        * `AFL_LLVM_BUG_SIZEFILL=1`  - check NULL-means-size-only idioms
+        * `AFL_LLVM_BUG_ALLOCSIZE=1` - track every malloc/calloc/realloc and
+                                       feed three signals (headroom IJON-min,
+                                       proximity-bucket coverage edge, soft-OOB
+                                       tripwire) per in-loop store
+        * `AFL_LLVM_BUG_ALLOCSIZE_FUNCS=Name1,Name2,...` - extend tracking
+                                       to user-listed custom allocators
+        * `AFL_LLVM_BUG=1`           - enable all four
+      Per-site bug-map slots are kept in a private MAP_SIZE_BUG region and
+      tracked max-rule (compatible with the IJON model)
+    - cmplog scheduling extensions (companion to bug-pass):
+        * `-l m` (afl-fuzz) - predicate-tightness scheduling. Treat any
+          new per-site minimum slack on an inequality CmpLog cmp as a
+          coverage event and mark the queue entry favoured. Catches the
+          libwebp-1.3.1 / CVE-2023-4863 input pattern (validation
+          predicates simultaneously at their tight edges).
+        * `AFL_LLVM_BUG_ALLOCSIZE_DERIVE=1` (compile-time) and
+          `-l z` (afl-fuzz) - size-derive logging. On every freed tracked
+          allocation, write `(computed_size, max_observed_offset)` into a
+          CmpLog RTN slot keyed by alloc-site. The existing CmpLog
+          dictionary mining harvests `computed_size` as a magic constant
+          and feeds the producing input bytes back into havoc.
   - IJON dist was changed to original IJON implementation: initial matching
     bytes, max length is 1024
   - lib* tools:
