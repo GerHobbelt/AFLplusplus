@@ -63,8 +63,8 @@
 #include <dlfcn.h>
 
 #ifdef __APPLE__
-  /* fishhook is used ang its from https://github.com/facebook/fishhook */
-  #include "fishhook.h"
+  /* fishhook is used and it is from https://github.com/facebook/fishhook */
+  #include "../macos_fishhook/fishhook.h"
 #endif
 
 #ifdef RTLD_NEXT
@@ -801,19 +801,22 @@ __attribute__((constructor)) void __tokencap_init(void) {
 #endif
 
 #ifdef __APPLE__
-  rebind_symbols((struct rebinding[]){
-                     {"strcmp", strcmp, (void **)&__libc_strcmp},
-                     {"strncmp", strncmp, (void **)&__libc_strncmp},
-                     {"strcasecmp", strcasecmp, (void **)&__libc_strcasecmp},
-                     {"strncasecmp", strncasecmp,
-                      (void **)&__libc_strncasecmp},
-                     {"memcmp", memcmp, (void **)&__libc_memcmp},
-                     {"bcmp", bcmp, (void **)&__libc_bcmp},
-                     {"strstr", strstr, (void **)&__libc_strstr},
-                     {"strcasestr", strcasestr, (void **)&__libc_strcasestr},
-                     {"memmem", memmem, (void **)&__libc_memmem},
-                 },
-                 9);
+  rebind_symbols(
+      (struct rebinding[]){
+
+          {"strcmp", strcmp, (void **)&__libc_strcmp},
+          {"strncmp", strncmp, (void **)&__libc_strncmp},
+          {"strcasecmp", strcasecmp, (void **)&__libc_strcasecmp},
+          {"strncasecmp", strncasecmp, (void **)&__libc_strncasecmp},
+          {"memcmp", memcmp, (void **)&__libc_memcmp},
+          {"bcmp", bcmp, (void **)&__libc_bcmp},
+          {"strstr", strstr, (void **)&__libc_strstr},
+          {"strcasestr", strcasestr, (void **)&__libc_strcasestr},
+          {"memmem", memmem, (void **)&__libc_memmem},
+
+      },
+
+      9);
 #endif
 
 }

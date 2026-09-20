@@ -4,6 +4,21 @@
   release of the tool. See README.md for the general instruction manual.
 
 
+### Version ++4.41a (dev)
+  - afl-fuzz:
+    - `-I tool` call now receives the new crash as a command line parameter
+    - changed to a better map classifier
+    - minor speed, leak and zombie enhancements
+    - somewhere we removed .state/variable/... now it is back :-)
+  - afl-cc:
+    - Fixes in the PCGUARD and LTO instrumentation that could lead to sanitizer
+      triggers in target binaries
+  - IJON dist was changed to original IJON implementation: initial matching
+    bytes, max length is 1024
+  - lib* tools:
+    - MacOS support is back, thanks to @Jay-1409 !
+
+
 ### Version ++4.40c (release)
   - afl-fuzz:
     - FrameShift integrated and enabled by default, disable with
