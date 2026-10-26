@@ -408,6 +408,11 @@ shared-memory test cases and hence gives you the fastest speed possible.
 For more information, see
 [utils/aflpp_driver/README.md](../utils/aflpp_driver/README.md).
 
+Writing a harness that actually exercises the interesting parts of the target is
+a skill of its own. For a practical walkthrough of what makes a harness
+effective - and the common mistakes that cripple one - see
+[https://srlabs.de/blog/unlocking-secrets-effective-fuzzing-harness](https://srlabs.de/blog/unlocking-secrets-effective-fuzzing-harness).
+
 ## 2. Preparing the fuzzing campaign
 
 As you fuzz the target with mutated input, having as diverse inputs for the
@@ -769,6 +774,18 @@ directives), `--summary` (one line per campaign / fleet roll-up), `--watch N`
 (live refresh every N seconds), `--on-change CMD` (run a hook when a campaign
 flips state or gains new crashes) and process exit codes suitable for cron/CI.
 
+A `DEGRADED` verdict always names its reason - `dead-instances`,
+`low-stability`, `exec-slowdown`, or a `+`-joined combination. Instances that
+are no longer running are told apart rather than lumped together: `killed` (died
+unexpectedly - OOM, SIGKILL, a crash), `stopped` (shut down cleanly by the user
+or by a `-V`/`-E` limit) and `leftover` (ran before the currently running
+instances started, i.e. a previous campaign generation that was not restarted).
+Only the first counts against the verdict, so deliberately stopped or retired
+instances no longer make a healthy campaign look degraded. The distinction comes
+from the `fastresume.bin` file, which afl-fuzz writes only on a clean shutdown
+(so it needs AFL++ >= 4.22a and no `AFL_NO_FASTRESUME`; otherwise the cause is
+reported as `unknown` and does count).
+
 Another tool to inspect the current state and history of a specific instance is
 afl-plot, which generates an index.html file and graphs that show how the
 fuzzing instance is performing. The syntax is `afl-plot instance_dir web_dir`,
@@ -823,6 +840,10 @@ and Rust). Feed its report to `cov-analysis` with `--reachability` to have the
 coverage report tell apart code that is *reachable but not reached yet* (the
 actionable gap) from code that is *unreachable* by the harness (expected to stay
 uncovered, so safe to ignore).
+
+For a walkthrough on how to read such coverage reports and turn them into
+concrete next steps for a campaign, see
+[https://srlabs.de/blog/coverage-analysis](https://srlabs.de/blog/coverage-analysis).
 
 If you see that an important area or a feature has not been covered so far, then
 try to find an input that is able to reach that and start a new secondary in

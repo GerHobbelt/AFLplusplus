@@ -9,20 +9,31 @@
     - for more variability, a "starved" mode is implemented now. If for a longer
       time no finds are found, then more seed and mutation variability is
       introduced incl. splicing phase enabled. This is visible in the UI.
+    - env `AFL_STARVED_MINIMIZE_QUEUE`: if starve mode does not help either,
+      minimize the the queue like afl-cmin does and make the coverage of the
+      removed entries rediscoverable. Inspired by `Novelty Not Found: Adaptive
+      Fuzzer Restarts to Improve Input Space Coverage`
+    - `-s fixed_seed` now only sets a fixed seed and does not ignore timings
+      anymore (required for proper benchmarking in containers without urandom)
+    - `-t xxx+` fix so dummy seeds do not kill a start-up. rechecks now over
+      time
+    - a queue entry that fails its calibration is never fuzzed, so the
+      coverage it claimed is now handed back to `virgin_bits` and can be
+      rediscovered by an input that does calibrate.
     - fixed SAND and FrameShift issues
     - enhancements and fixes for cmplog and ijon
   - afl-cc
-    - remove classic AFL instrumentation (colliding coverage), as AFL_LLVM_PATH
-      and AFL_LLVM_CALLER replace these mostly and are overall much better
+    - remove classic AFL instrumentation (colliding coverage), as `AFL_LLVM_PATH`
+      and `AFL_LLVM_CALLER` replace these mostly and are overall much better
     - removed the obsolete afl-as assembler wrapper and its remaining references
   - afl-cmin:
     - (all variants: C, python, bash, awk): empty (0 byte) input files are now
-      skipped
+      skipped, plus various other fixes and corner case handling
     - afl-merge (symlink) - merge new files into an existing corpus (that is
       not minimized)
-    - afl-cmin.c is now the default afl-cmin
+    - afl-cmin.c is now the default afl-cmin, but it needed a larger rewrite
   - afl-health
-    - more speed, more info
+    - more speed, more info, a few fixes
   - custom_mutators:
     - removed outdated and pointless radamsa
 
@@ -36,6 +47,8 @@
     - Futex implementation missed the clean-up of the shmem
     - Futex shmem now lives in general shared memory map as by default only
       32 such regions are supported in MacOS
+    - new runtime value-profiling guidance mode (`-r0`/`-rN`) for LLVM targets
+      compiled with `AFL_LLVM_VALUE_PROFILE=1`
   - afl-cc:
     - new C11 mode (`AFL_LLVM_C11` at compile time): afl-cc records each
       function's local variable count and afl-fuzz uses it as an extra queue
@@ -214,7 +227,7 @@
     - multiple AFL++ out directories now supported, thanks to @Jay-1409 !
 
 
-### Version ++4.35a (release)
+### Version ++4.35c (release)
   - GUIFuzz++ merged: Unleashing Grey-box Fuzzing on Desktop Graphical User
                       Interfacing Applications
     https://futures.cs.utah.edu/papers/25ASE.pdf

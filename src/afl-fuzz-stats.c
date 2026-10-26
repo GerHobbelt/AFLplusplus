@@ -262,6 +262,25 @@ void load_stats_file(afl_state_t *afl) {
 
       }
 
+      if (key_matches("vp_start_time", keystring)) {
+
+        afl->vp_start_time = 1000 * strtoull(lptr, &nptr, 10);
+
+      }
+
+      if (key_matches("value_profile_finds", keystring)) {
+
+        afl->value_profile_finds = strtoull(lptr, &nptr, 10);
+
+      }
+
+      if (key_matches("last_cov_find_time", keystring)) {
+
+        /* Restore the edge-coverage clock used for VP stagnation. */
+        afl->last_edge_time = 1000 * strtoull(lptr, &nptr, 10);
+
+      }
+
       if (key_matches("trim_time", keystring)) {
 
         afl->trim_time_us = strtoull(lptr, &nptr, 10) * 1000000;
@@ -386,7 +405,7 @@ void write_stats_file(afl_state_t *afl, u32 t_bytes, double bitmap_cvg,
   snprintf(fn_final, PATH_MAX, "%s/fuzzer_stats", afl->out_dir);
   f = create_ffile(fn_tmp, afl->perm);
 
-  if (afl->chown_needed) {
+  if (unlikely(afl->chown_needed)) {
 
     if (chown(fn_tmp, -1, afl->fsrv.gid) == -1) { PFATAL("fchown() failed"); }
 
@@ -395,7 +414,7 @@ void write_stats_file(afl_state_t *afl, u32 t_bytes, double bitmap_cvg,
   /* Keep last values in case we're called from another context
      where exec/sec stats and such are not readily available. */
 
-  if (!bitmap_cvg && !stability && !eps) {
+  if (unlikely(!bitmap_cvg && !stability && !eps)) {
 
     bitmap_cvg = afl->last_bitmap_cvg;
     stability = afl->last_stability;
@@ -420,7 +439,7 @@ void write_stats_file(afl_state_t *afl, u32 t_bytes, double bitmap_cvg,
   }
 
 #ifndef __HAIKU__
-  if (getrusage(RUSAGE_CHILDREN, &rus)) { rus.ru_maxrss = 0; }
+  if (unlikely(getrusage(RUSAGE_CHILDREN, &rus))) { rus.ru_maxrss = 0; }
   #ifdef __APPLE__
   u64 cur_rss_mb = (u64)rus.ru_maxrss >> 20;
   #else
@@ -439,7 +458,7 @@ void write_stats_file(afl_state_t *afl, u32 t_bytes, double bitmap_cvg,
       (afl->calibration_time_us + afl->sync_time_us + afl->trim_time_us +
        afl->cmplog_time_us + afl->table_time_us) /
       1000;
-  if (!runtime_ms) { runtime_ms = 1; }
+  if (unlikely(!runtime_ms)) { runtime_ms = 1; }
 
   fprintf(
       f,
@@ -467,6 +486,7 @@ void write_stats_file(afl_state_t *afl, u32 t_bytes, double bitmap_cvg,
       "corpus_found      : %u\n"
       "corpus_imported   : %u\n"
       "corpus_variable   : %u\n"
+      "corpus_disabled   : %u\n"
       "max_depth         : %u\n"
       "cur_item          : %u\n"
       "pending_favs      : %u\n"
@@ -514,12 +534,12 @@ void write_stats_file(afl_state_t *afl, u32 t_bytes, double bitmap_cvg,
       afl->fsrv.total_execs / ((double)(runtime_ms) / 1000),
       afl->last_avg_execs_saved, afl->queued_items, afl->queued_favored,
       afl->queued_discovered, afl->queued_imported, afl->queued_variable,
-      afl->max_depth, afl->current_entry, afl->pending_favored,
-      afl->pending_not_fuzzed, stability, bitmap_cvg, afl->saved_crashes,
-      afl->saved_hangs, afl->total_tmouts, afl->last_find_time / 1000,
-      afl->last_crash_time / 1000, afl->last_hang_time / 1000,
-      afl->fsrv.total_execs - afl->last_crash_execs, afl->last_edge_execs,
-      afl->fsrv.exec_tmout, afl->slowest_exec_ms,
+      afl->disabled_items, afl->max_depth, afl->current_entry,
+      afl->pending_favored, afl->pending_not_fuzzed, stability, bitmap_cvg,
+      afl->saved_crashes, afl->saved_hangs, afl->total_tmouts,
+      afl->last_find_time / 1000, afl->last_crash_time / 1000,
+      afl->last_hang_time / 1000, afl->fsrv.total_execs - afl->last_crash_execs,
+      afl->last_edge_execs, afl->fsrv.exec_tmout, afl->slowest_exec_ms,
 #ifndef __HAIKU__
       (unsigned long int)afl->peak_rss_mb,
 #else
@@ -549,7 +569,13 @@ void write_stats_file(afl_state_t *afl, u32 t_bytes, double bitmap_cvg,
 
   fprintf(f, "starved_count     : %llu\n", afl->starved_count);
 
-  if (afl->san_binary_length) {
+  if (unlikely(afl->afl_env.afl_starved_minimize_queue)) {
+
+    fprintf(f, "starve_minimized  : %llu\n", afl->starved_minimize_count);
+
+  }
+
+  if (unlikely(afl->san_binary_length)) {
 
     for (u8 i = 0; i < afl->san_binary_length; i++) {
 
@@ -564,7 +590,7 @@ void write_stats_file(afl_state_t *afl, u32 t_bytes, double bitmap_cvg,
 
   /* ignore errors */
 
-  if (afl->debug) {
+  if (unlikely(afl->debug)) {
 
     u32 i = 0;
     fprintf(f, "virgin_bytes     :");
@@ -582,11 +608,22 @@ void write_stats_file(afl_state_t *afl, u32 t_bytes, double bitmap_cvg,
     fprintf(f, "var_bytes        :");
     for (i = 0; i < afl->fsrv.real_map_size; i++) {
 
-      if (afl->var_bytes[i]) { fprintf(f, " %u", i); }
+      if (unlikely(afl->var_bytes[i])) { fprintf(f, " %u", i); }
 
     }
 
     fprintf(f, "\n");
+
+  }
+
+  if (afl->value_profile_mode) {
+
+    fprintf(f, "value_profile_finds  : %llu\n",
+            (unsigned long long)afl->value_profile_finds);
+    fprintf(f, "vp_start_time        : %llu\n",
+            (unsigned long long)(afl->vp_start_time / 1000));
+    fprintf(f, "last_cov_find_time   : %llu\n",
+            (unsigned long long)(afl->last_edge_time / 1000));
 
   }
 
@@ -600,7 +637,7 @@ void write_queue_stats(afl_state_t *afl) {
 
   FILE *f;
   u8   *fn = alloc_printf("%s/queue_data", afl->out_dir);
-  if ((f = fopen(fn, "w")) != NULL) {
+  if (likely((f = fopen(fn, "w")) != NULL)) {
 
     u32 id;
     fprintf(f,
@@ -2487,11 +2524,7 @@ void show_init_stats(afl_state_t *afl) {
 
   /* Let's keep things moving with slow binaries. */
 
-  if (unlikely(afl->fixed_seed)) {
-
-    afl->havoc_div = 1;
-
-  } else if (avg_us > 50000) {
+  if (avg_us > 50000) {
 
     afl->havoc_div = 10;                                /* 0-19 execs/sec   */
 
@@ -2571,11 +2604,7 @@ void show_init_stats(afl_state_t *afl) {
        random scheduler jitter is less likely to have any impact, and because
        our patience is wearing thin =) */
 
-    if (unlikely(afl->fixed_seed)) {
-
-      afl->fsrv.exec_tmout = avg_us * 5 / 1000;
-
-    } else if (avg_us > 50000) {
+    if (avg_us > 50000) {
 
       afl->fsrv.exec_tmout = avg_us * 2 / 1000;
 
@@ -2593,14 +2622,21 @@ void show_init_stats(afl_state_t *afl) {
     afl->fsrv.exec_tmout =
         (afl->fsrv.exec_tmout + EXEC_TM_ROUND) / EXEC_TM_ROUND * EXEC_TM_ROUND;
 
-    if (afl->fsrv.exec_tmout > EXEC_TIMEOUT) {
+    u32 cap = afl->exec_tmout_ceil ? afl->exec_tmout_ceil : EXEC_TIMEOUT;
 
-      afl->fsrv.exec_tmout = EXEC_TIMEOUT;
+    if (afl->fsrv.exec_tmout > cap) { afl->fsrv.exec_tmout = cap; }
+
+    if (afl->exec_tmout_ceil) {
+
+      ACTF("-t %u+ specified, starting with an exec timeout of %u ms.",
+           afl->exec_tmout_ceil, afl->fsrv.exec_tmout);
+
+    } else {
+
+      ACTF("No -t option specified, so I'll use an exec timeout of %u ms.",
+           afl->fsrv.exec_tmout);
 
     }
-
-    ACTF("No -t option specified, so I'll use an exec timeout of %u ms.",
-         afl->fsrv.exec_tmout);
 
     afl->timeout_given = 1;
 

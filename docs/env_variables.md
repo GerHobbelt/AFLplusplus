@@ -136,7 +136,7 @@ subset of the settings discussed in section 1, with the exception of:
     afl-fuzz' `-x` option.
 
   - An option to `AFL_LLVM_DICT2FILE` is `AFL_LLVM_DICT2FILE_NO_MAIN=1` which
-    skill not parse `main()`.
+    will not parse `main()`.
 
   - LLVM modes compiling C++ will normally set rpath in the binary if LLVM is
     not in a usual location (/usr or /lib). Setting `AFL_LLVM_NO_RPATH=1`
@@ -335,6 +335,11 @@ Setting `AFL_LLVM_CMPLOG=1` during compilation will tell afl-clang-fast to
 produce a CmpLog binary.
 
 For afl-gcc-fast, set `AFL_GCC_CMPLOG=1` instead.
+
+Value-profile compare-observer builds run a small mem2reg promotion before
+compare hook insertion so `-O0` builds expose canonical loop counters to
+loop-control filtering. Set `AFL_LLVM_NO_COMPARE_MEM2REG=1` to disable this
+promotion.
 
 For more information, see
 [instrumentation/README.cmplog.md](../instrumentation/README.cmplog.md).
@@ -580,6 +585,25 @@ checks or alter some of the more exotic semantics of the tool:
     (`-i in`). This is an important feature to set when resuming a fuzzing
     session.
 
+  - Value-profile guidance is controlled by command-line options:
+      - `-r 0`: enable runtime value profiling from startup.
+      - `-r N`: enable runtime value profiling after `N` seconds without new
+        edge coverage, then keep it enabled for the rest of the run.
+    Value profiling may help when compare operands are transformed in ways
+    that make direct solve attempts less effective.
+    Notes:
+      - Value profiling requires binaries compiled with
+        `AFL_LLVM_VALUE_PROFILE=1`.
+      - Value profiling and CmpLog are alternative compare-observer
+        instrumentation modes for a single compile. Build a separate CmpLog
+        binary and pass it with `-c` if you want to use CmpLog in the same
+        fuzzing session.
+      - Runtime value profiling requires an LLVM-instrumented main target and
+        is not supported with `-n`, QEMU, Frida, Unicorn, CoreSight, or Nyx
+        execution modes.
+      - Routine-compare VP features record separate matched-prefix and
+        whole-buffer hamming-distance signals.
+
   - `AFL_IGNORE_SEED_PROBLEMS` will skip over crashes and timeouts in the seeds
     instead of exiting.
 
@@ -644,6 +668,19 @@ checks or alter some of the more exotic semantics of the tool:
 
   - Setting `AFL_DISABLE_REDUNDANT` disables any queue items that are redundant.
     This can be useful with huge queues.
+
+  - `AFL_STARVED_MINIMIZE_QUEUE` minimizes the queue once afl-fuzz has been in
+    starve mode - which it enters after 5 million executions without a new edge
+    - for another 5 million executions without a new edge. Every enabled queue
+    entry is executed again to score it freshly, then all entries that are not
+    needed to reach the coverage of the whole queue are disabled, the same
+    selection `afl-cmin` performs. Entries that were never fuzzed are always
+    kept. The coverage that is lost this way is reset in the virgin bitmap, so
+    it can be found again - by smaller and faster inputs, hopefully. With `-B`
+    the bitmap is left untouched, because it is an explicit baseline of coverage
+    that shall not be rediscovered. How often the queue was really minimized -
+    which requires that entries were actually disabled - is reported as
+    `starve_minimized` in the `fuzzer_stats` file.
 
   - Setting `AFL_KEEP_TIMEOUTS` will keep longer running inputs if they reach
     new coverage
@@ -1129,23 +1166,33 @@ support.
   dump you must set a sufficient timeout (using `-t`) to avoid `afl-fuzz`
   killing the process whilst it is being dumped.
 
-## 8) Settings for afl-cmin
+## 8) Settings for afl-cmin and afl-merge
 
-The corpus minimization script offers very little customization:
+`afl-cmin` (and its `afl-merge` symlink) offers very little customization:
 
-  - `AFL_ALLOW_TMP` permits this and some other scripts to run in /tmp. This is
-    a modest security risk on multi-user systems with rogue users, but should be
-    safe on dedicated fuzzing boxes.
+  - `AFL_MAP_SIZE` (alias `AFL_MAPSIZE`) sets the coverage map size instead of
+    detecting it from the target. The value is validated and rounded up to a
+    multiple of 64, exactly as for the other tools.
 
-  - `AFL_KEEP_TRACES` makes the tool keep traces and other metadata used for
-    minimization and normally deleted at exit. The files can be found in the
-    `<out_dir>/.traces/` directory.
+  - `AFL_SHA1_FILENAMES` names the output files after the SHA-1 of their
+    contents instead of keeping the original file name.
 
-  - Setting `AFL_PATH` offers a way to specify the location of afl-showmap and
-    afl-qemu-trace (the latter only in `-Q` mode).
+  - `AFL_INPUT_PLACEHOLDER` replaces `@@` as the input file placeholder in the
+    target command line.
 
-  - `AFL_PRINT_FILENAMES` prints each filename to stdout, as it gets processed.
-    This can help when embedding `afl-cmin` or `afl-showmap` in other scripts.
+  - Setting `AFL_PATH` offers a way to specify the location of afl-qemu-trace
+    (`-Q` mode) and libnyx.so (`-X` mode).
+
+  - `AFL_SKIP_BIN_CHECK` skips the instrumentation check of the target binary.
+
+  Temporary files (the test case handed to the target and the per-worker trace
+  logs) are kept in a private directory below the output directory that is
+  removed again when the run ends, also when it fails.
+
+  The script variants (`afl-cmin.py`, `afl-cmin.bash`) collect coverage with
+  `afl-showmap` and additionally honor `AFL_ALLOW_TMP`, `AFL_KEEP_TRACES`
+  (leaving `<out_dir>/.traces/` in place) and `AFL_CMIN_ALLOW_ANY`, plus every
+  `afl-showmap` variable such as `AFL_PRINT_FILENAMES`.
 
 ## 9) Settings for afl-tmin
 

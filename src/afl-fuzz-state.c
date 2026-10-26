@@ -85,6 +85,8 @@ void afl_state_init(afl_state_t *afl, uint32_t map_size) {
   afl->virgin_bits = ck_alloc(map_size);
   afl->virgin_tmout = ck_alloc(map_size);
   afl->virgin_crash = ck_alloc(map_size);
+  afl->virgin_undo = ck_alloc(map_size);
+  afl->virgin_reclaim = ck_alloc(map_size);
   afl->var_bytes = ck_alloc(map_size);
   afl->top_rated = ck_alloc(map_size * sizeof(void *));
   afl->clean_trace = ck_alloc(map_size);
@@ -135,6 +137,9 @@ void afl_resize_map_buffers(afl_state_t *afl, u32 old_size, u32 new_size) {
   afl->virgin_bits = ck_realloc(afl->virgin_bits, new_size);
   afl->virgin_tmout = ck_realloc(afl->virgin_tmout, new_size);
   afl->virgin_crash = ck_realloc(afl->virgin_crash, new_size);
+  afl->virgin_undo = ck_realloc(afl->virgin_undo, new_size);
+  afl->virgin_reclaim = ck_realloc(afl->virgin_reclaim, new_size);
+  afl->virgin_undo_valid = 0;
   afl->var_bytes = ck_realloc(afl->var_bytes, new_size);
   afl->top_rated = ck_realloc(afl->top_rated, new_size * sizeof(void *));
 
@@ -148,6 +153,7 @@ void afl_resize_map_buffers(afl_state_t *afl, u32 old_size, u32 new_size) {
     u32 size_diff = new_size - old_size;
 
     memset(afl->var_bytes + old_size, 0, size_diff);
+    memset(afl->virgin_reclaim + old_size, 0, size_diff);
     memset(afl->top_rated + old_size, 0, size_diff * sizeof(void *));
 
     memset(afl->clean_trace + old_size, 0, size_diff);
@@ -345,6 +351,13 @@ void read_afl_environment(afl_state_t *afl, char **envp) {
                               afl_environment_variable_len)) {
 
             afl->afl_env.afl_disable_redundant =
+                get_afl_env(afl_environment_variables[i]) ? 1 : 0;
+
+          } else if (!strncmp(env, "AFL_STARVED_MINIMIZE_QUEUE",
+
+                              afl_environment_variable_len)) {
+
+            afl->afl_env.afl_starved_minimize_queue =
                 get_afl_env(afl_environment_variables[i]) ? 1 : 0;
 
           } else if (!strncmp(env, "AFL_NO_STARTUP_CALIBRATION",
@@ -934,6 +947,8 @@ void afl_state_deinit(afl_state_t *afl) {
   ck_free(afl->virgin_crash);
   ck_free(afl->var_bytes);
   ck_free(afl->top_rated);
+  if (afl->vp_frontier) { ck_free(afl->vp_frontier); }
+
   ck_free(afl->clean_trace);
   ck_free(afl->clean_trace_custom);
   ck_free(afl->first_trace);

@@ -87,6 +87,31 @@ inline u32 select_next_queue_entry(afl_state_t *afl) {
 
 }
 
+/* mean log2(n_fuzz) over the active queue, used by the COE schedule. It is the
+   same for every entry, so it is computed once per alias table build. */
+
+static void update_coe_fuzz_mu(afl_state_t *afl) {
+
+  long double fuzz_mu = 0.0;
+  u32         n_items = 0;
+
+  for (u32 i = 0; i < afl->queued_items; i++) {
+
+    if (likely(!afl->queue_buf[i]->disabled)) {
+
+      fuzz_mu += log2(afl->n_fuzz[afl->queue_buf[i]->n_fuzz_entry]);
+      ++n_items;
+
+    }
+
+  }
+
+  if (unlikely(!n_items)) { FATAL("Queue state corrupt"); }
+
+  afl->coe_fuzz_mu = fuzz_mu / n_items;
+
+}
+
 /* create the alias table that allows weighted random selection - expensive */
 
 void create_alias_table(afl_state_t *afl) {
@@ -190,6 +215,13 @@ void create_alias_table(afl_state_t *afl) {
     avg_exec_us /= active;
     avg_bitmap_size /= active;
     avg_len /= active;
+
+    if (unlikely(afl->schedule == COE)) {
+
+      update_coe_fuzz_mu(afl);
+      afl->coe_mu_cached = 1;
+
+    }
 
     if (unlikely(c11_max && !afl->starved)) {
 
@@ -528,6 +560,7 @@ void create_alias_table(afl_state_t *afl) {
   free(Large);
   afl->reinit_table = 0;
   afl->pending_reinit = 0;
+  afl->coe_mu_cached = 0;
 
   /*
   #ifdef INTROSPECTION
@@ -647,7 +680,12 @@ void mark_as_redundant(afl_state_t *afl, struct queue_entry *q, u8 state) {
 
   if (state) {
 
-    if (unlikely(afl->afl_env.afl_disable_redundant)) { q->disabled = 1; }
+    if (unlikely(afl->afl_env.afl_disable_redundant)) {
+
+      q->disabled = 1;
+      ++afl->disabled_items;
+
+    }
 
   }
 
@@ -1027,6 +1065,17 @@ void destroy_queue(afl_state_t *afl) {
    previous contender, or if the contender has a more favorable speed x size
    factor. */
 
+static inline void queue_entry_dec_tc_ref(afl_state_t        *afl,
+                                          struct queue_entry *q) {
+
+  if (--q->tc_ref) return;
+
+  ck_free(q->trace_mini);
+  q->trace_mini = NULL;
+  vp_coverage_owner_released(afl, q);
+
+}
+
 void update_bitmap_score(afl_state_t *afl, struct queue_entry *q,
                          bool have_trace) {
 
@@ -1050,7 +1099,7 @@ void update_bitmap_score(afl_state_t *afl, struct queue_entry *q,
 
   }
 
-  if (unlikely(afl->saved_schedule >= RARE) || unlikely(afl->fixed_seed)) {
+  if (unlikely(afl->saved_schedule >= RARE)) {
 
     fav_factor = q->len << 2;
 
@@ -1090,8 +1139,7 @@ void update_bitmap_score(afl_state_t *afl, struct queue_entry *q,
 
           }
 
-          if (unlikely(afl->saved_schedule >= RARE) ||
-              unlikely(afl->fixed_seed)) {
+          if (unlikely(afl->saved_schedule >= RARE)) {
 
             top_rated_fav_factor = afl->top_rated[i]->len << 2;
 
@@ -1110,12 +1158,7 @@ void update_bitmap_score(afl_state_t *afl, struct queue_entry *q,
              previous winner, discard its afl->fsrv.trace_bits[] if necessary.
            */
 
-          if (!--afl->top_rated[i]->tc_ref) {
-
-            ck_free(afl->top_rated[i]->trace_mini);
-            afl->top_rated[i]->trace_mini = NULL;
-
-          }
+          queue_entry_dec_tc_ref(afl, afl->top_rated[i]);
 
         }
 
@@ -1142,6 +1185,176 @@ void update_bitmap_score(afl_state_t *afl, struct queue_entry *q,
 
 }
 
+/* Run one queue entry with the calibration timeout and classify its trace.
+   Returns 0 if the target did not behave as expected, in which case the trace
+   must not be used: a transient timeout or crash contributes coverage that no
+   normal execution of the entry produces. */
+
+static u8 minimize_run_entry(afl_state_t *afl, struct queue_entry *q) {
+
+  u32 use_tmout = MAX(afl->fsrv.exec_tmout + CAL_TMOUT_ADD,
+                      afl->fsrv.exec_tmout * CAL_TMOUT_PERC / 100);
+  u8 *mem = queue_testcase_get(afl, q);
+
+  (void)write_to_testcase(afl, (void **)&mem, q->len, 1);
+
+  fsrv_run_result_t fault = fuzz_run_target(afl, &afl->fsrv, use_tmout);
+
+  if (unlikely(fault == FSRV_RUN_ERROR)) {
+
+    FATAL("Unable to execute target application ('%s')", afl->argv[0]);
+
+  }
+
+  if (unlikely(fault != afl->crash_mode || afl->stop_soon)) { return 0; }
+
+  classify_counts(&afl->fsrv);
+
+  return 1;
+
+}
+
+/* First phase of the starved queue minimization: discard the top_rated scores
+   and rebuild them from the current traces of the enabled entries, so that the
+   favored set cull_queue() computes next is the minimal set of entries that
+   covers every edge the enabled queue reaches - the selection afl-cmin makes.
+   The rebuild is necessary because top_rated is not repaired when an entry is
+   disabled, and a fast resume does not restore it at all, so the favored set on
+   its own cannot be trusted to still cover the queue. */
+
+static void minimize_queue_rescore(afl_state_t *afl) {
+
+  u32 i;
+
+  for (i = 0; i < afl->queued_items; i++) {
+
+    struct queue_entry *q = afl->queue_buf[i];
+
+    if (q->trace_mini) {
+
+      ck_free(q->trace_mini);
+      q->trace_mini = NULL;
+
+    }
+
+    q->tc_ref = 0;
+
+  }
+
+  memset((u8 *)afl->top_rated, 0, afl->fsrv.map_size * sizeof(void *));
+
+  for (i = 0; i < afl->queued_items; i++) {
+
+    struct queue_entry *q = afl->queue_buf[i];
+
+    if (q->disabled) { continue; }
+
+    if (likely(minimize_run_entry(afl, q))) {
+
+      update_bitmap_score(afl, q, true);
+
+    }
+
+    if (unlikely(afl->stop_soon)) { return; }
+
+  }
+
+  afl->score_changed = 1;
+  afl->starve_minimize = 2;
+
+}
+
+/* Second phase, in the spirit of afl-cmin: cull_queue() has just recomputed the
+   favored set from the rebuilt scores, so every entry that is not favored and
+   was fuzzed already is disabled. virgin_bits is then rebuilt from the entries
+   that remain, which makes the coverage that only the disabled entries reached
+   - in practice their hit counts - discoverable again. The new map is only
+   published if every remaining entry could be replayed, and it is skipped for a
+   -B bitmap, which is an explicit baseline that shall not be rediscovered. */
+
+static void minimize_queue_disable(afl_state_t *afl) {
+
+  u32 i, active = 0, favored = 0, disabled = 0;
+
+  afl->starve_minimize = 3;
+
+  for (i = 0; i < afl->queued_items; i++) {
+
+    if (afl->queue_buf[i]->disabled) { continue; }
+    ++active;
+    if (unlikely(afl->queue_buf[i]->favored)) { ++favored; }
+
+  }
+
+  if (unlikely(!favored)) { return; }
+
+  for (i = 0; i < afl->queued_items; i++) {
+
+    struct queue_entry *q = afl->queue_buf[i];
+
+    if (q->favored || q->disabled || !q->was_fuzzed) { continue; }
+
+    --afl->active_items;
+    ++afl->disabled_items;
+    q->disabled = 1;
+    q->perf_score = 0;
+    ++disabled;
+
+  }
+
+  if (unlikely(!disabled)) { return; }
+
+  ++afl->starved_minimize_count;
+
+  if (afl->afl_env.afl_no_ui) {
+
+    ACTF("Minimized the queue while starved, %u of %u entries disabled",
+         disabled, active);
+
+  }
+
+  if (unlikely(afl->in_bitmap)) { return; }
+
+  u8 *new_virgin = ck_alloc(afl->fsrv.map_size);
+  u8  complete = 1;
+
+  memset(new_virgin, 255, afl->fsrv.map_size);
+
+  for (i = 0; i < afl->fsrv.map_size; i++) {
+
+    if (unlikely(afl->var_bytes[i])) { new_virgin[i] = 0; }
+
+  }
+
+  for (i = 0; i < afl->queued_items; i++) {
+
+    struct queue_entry *q = afl->queue_buf[i];
+
+    if (likely(q->disabled)) { continue; }
+
+    if (likely(minimize_run_entry(afl, q))) {
+
+      (void)has_new_bits(afl, new_virgin);
+
+    } else if (unlikely(afl->stop_soon)) {
+
+      complete = 0;
+      break;
+
+    }
+
+  }
+
+  if (likely(complete)) {
+
+    memcpy(afl->virgin_bits, new_virgin, afl->fsrv.map_size);
+
+  }
+
+  ck_free(new_virgin);
+
+}
+
 /* The second part of the mechanism discussed above is a routine that
    goes over afl->top_rated[] entries, and then sequentially grabs winners for
    previously-unseen bytes (temp_v) and marks them as favored, at least
@@ -1157,6 +1370,12 @@ inline void cull_queue(afl_state_t *afl) {
   u8 *temp_v = afl->map_tmp_buf;
 
   afl->score_changed = 0;
+
+  if (unlikely(afl->vp_delayed_evictions_pending)) {
+
+    vp_apply_delayed_evictions(afl);
+
+  }
 
   memset(temp_v, 255, len);
 
@@ -1208,6 +1427,8 @@ inline void cull_queue(afl_state_t *afl) {
   /* Let's see if anything in the bitmap isn't captured in temp_v.
      If yes, and if it has a afl->top_rated[] contender, let's use it. */
 
+  u8 vp_favoring_active = afl->vp_frontier && afl->value_profile_active;
+
   for (i = 0; i < afl->fsrv.map_size; ++i) {
 
     if (afl->top_rated[i] && (temp_v[i >> 3] & (1 << (i & 7))) &&
@@ -1252,11 +1473,27 @@ inline void cull_queue(afl_state_t *afl) {
 
   for (i = 0; i < afl->queued_items; i++) {
 
+    if (vp_favoring_active) {
+
+      vp_mark_favored_queue_entry(afl, afl->queue_buf[i]);
+
+    }
+
     if (likely(!afl->queue_buf[i]->disabled)) {
 
       mark_as_redundant(afl, afl->queue_buf[i], !afl->queue_buf[i]->favored);
 
     }
+
+  }
+
+  if (unlikely(afl->starve_minimize == 1)) {
+
+    minimize_queue_rescore(afl);
+
+  } else if (unlikely(afl->starve_minimize == 2)) {
+
+    minimize_queue_disable(afl);
 
   }
 
@@ -1290,7 +1527,7 @@ u32 calculate_score(afl_state_t *afl, struct queue_entry *q) {
   // Longer execution time means longer work on the input, the deeper in
   // coverage, the better the fuzzing, right? -mh
 
-  if (likely(afl->schedule < RARE) && likely(!afl->fixed_seed)) {
+  if (likely(afl->schedule < RARE)) {
 
     if (q->exec_us * 0.1 > avg_exec_us) {
 
@@ -1323,6 +1560,8 @@ u32 calculate_score(afl_state_t *afl, struct queue_entry *q) {
     }
 
   }
+
+  u32 speed_score = perf_score;
 
   /* Adjust score based on bitmap size. The working theory is that better
      coverage translates to better targets. Multiplier from 0.25x to 3x. */
@@ -1389,9 +1628,7 @@ u32 calculate_score(afl_state_t *afl, struct queue_entry *q) {
 
   }
 
-  u32         n_items;
-  double      factor = 1.0;
-  long double fuzz_mu;
+  double factor = 1.0;
 
   switch (afl->schedule) {
 
@@ -1406,29 +1643,12 @@ u32 calculate_score(afl_state_t *afl, struct queue_entry *q) {
       break;
 
     case COE:
-      fuzz_mu = 0.0;
-      n_items = 0;
-
       // Don't modify perf_score for unfuzzed seeds
       if (!q->fuzz_level) break;
 
-      u32 i;
-      for (i = 0; i < afl->queued_items; i++) {
+      if (unlikely(!afl->coe_mu_cached)) { update_coe_fuzz_mu(afl); }
 
-        if (likely(!afl->queue_buf[i]->disabled)) {
-
-          fuzz_mu += log2(afl->n_fuzz[afl->queue_buf[i]->n_fuzz_entry]);
-          n_items++;
-
-        }
-
-      }
-
-      if (unlikely(!n_items)) { FATAL("Queue state corrupt"); }
-
-      fuzz_mu = fuzz_mu / n_items;
-
-      if (log2(afl->n_fuzz[q->n_fuzz_entry]) > fuzz_mu) {
+      if (log2(afl->n_fuzz[q->n_fuzz_entry]) > afl->coe_fuzz_mu) {
 
         /* Never skip favourites */
         if (!q->favored) factor = 0;
@@ -1530,6 +1750,12 @@ u32 calculate_score(afl_state_t *afl, struct queue_entry *q) {
 
     if (factor > MAX_FACTOR) { factor = MAX_FACTOR; }
     perf_score *= factor / POWER_BETA;
+
+  }
+
+  if (unlikely(afl->starved)) {
+
+    perf_score = speed_score * sqrt((double)perf_score / speed_score);
 
   }
 

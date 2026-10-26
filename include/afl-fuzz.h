@@ -38,7 +38,6 @@
 #ifndef _FILE_OFFSET_BITS
   #define _FILE_OFFSET_BITS 64
 #endif
-
 #include "config.h"
 #ifdef HAVE_ZLIB
   #include <zlib.h>
@@ -278,9 +277,14 @@ struct queue_entry {
   u32 c11;                              /* C11 value                        */
 
   u8 colorized,                         /* Do not run redqueen stage again  */
-      cal_failed;                       /* Calibration failed?              */
+      cal_failed,                       /* Calibration failed?              */
+      vp_only;                          /* Added only due to VP guidance?   */
+
+  u32 vp_ref_cnt,                      /* Number of owned VP frontier slots */
+      vp_unresolved_ref_cnt;           /* Owned unresolved VP frontier slots*/
 
   bool trim_done,                       /* Trimmed?                         */
+      vp_trim_deferred,                 /* VP-owner trim deferred?          */
       was_fuzzed,                       /* historical, but needed for MOpt  */
       passed_det,                       /* Deterministic stages passed?     */
       has_new_cov,                      /* Triggers new coverage?           */
@@ -289,8 +293,8 @@ struct queue_entry {
       fs_redundant,                     /* Marked as redundant in the fs?   */
       is_ascii,                         /* Is the input just ascii text?    */
       disabled,                         /* Is disabled from fuzz selection  */
-      tightness_novel; /* New per-site min-slack on any
-                          inequality cmp; keep favoured.   */
+      tightness_novel;  /* New per-site min-slack on any
+                           inequality cmp; keep favoured.   */
 
   u32 bitmap_size,                      /* Number of bits set in bitmap     */
 #ifdef INTROSPECTION
@@ -303,7 +307,8 @@ struct queue_entry {
       fuzz_level,                       /* Number of fuzzing iterations     */
       n_fuzz_entry;                     /* offset in n_fuzz                 */
 
-  u64 exec_us,                          /* Execution time (us)              */
+  u64 vp_last_ref_cycle,                /* queue_cycle when vp_ref_cnt->0   */
+      exec_us,                          /* Execution time (us)              */
       handicap,                         /* Number of queue cycles behind    */
       depth,                            /* Path depth                       */
       exec_cksum,                       /* Checksum of the execution trace  */
@@ -336,6 +341,28 @@ struct queue_entry {
   u32 tightness_novel_cycle;            /* cycle when tightness_novel set   */
 
 };
+
+typedef struct {
+
+  struct queue_entry *owner;    /* Frontier owner                           */
+  u32                 dist;     /* Frontier distance                        */
+
+} vp_frontier_entry_t;
+
+typedef struct vp_trim_guard vp_trim_guard_t;
+
+/* Value-profile trim callbacks passed to trim_case_custom(). Bundling them in
+   one struct keeps trim_case_custom() free of direct references to the VP
+   module, so afl-showmap/afl-tmin can link afl-fuzz-mutators.c without pulling
+   in afl-fuzz-valprof.c. A NULL pointer (or NULL guard) means "no VP guard". */
+typedef struct vp_trim_hooks {
+
+  vp_trim_guard_t *guard;                 /* Active trim guard, or NULL     */
+  void (*before_exec)(vp_trim_guard_t *); /* Arm runtime VP observation     */
+  u8 (*preserved)(vp_trim_guard_t *);     /* Owned VP signal survived trim? */
+  void (*after_exec)(vp_trim_guard_t *);  /* Restore runtime VP state       */
+
+} vp_trim_hooks_t;
 
 struct extra_data {
 
@@ -584,7 +611,7 @@ typedef struct afl_env_vars {
       afl_final_sync, afl_ignore_seed_problems, afl_disable_redundant,
       afl_sha1_filenames, afl_no_sync, afl_no_fastresume, afl_force_fastresume,
       afl_forksrv_uid_set, afl_forksrv_gid_set, afl_frameshift_disabled,
-      afl_crash_traces;
+      afl_crash_traces, afl_starved_minimize_queue;
 
   u16 afl_forksrv_nb_supl_gids;
 
@@ -643,7 +670,8 @@ typedef struct afl_state {
   /* Status UI and timing globals where it really makes no sense to haul them
      around as function parameters. */
   u64 most_time_key, most_time, most_execs_key, most_execs, force_ui_update,
-      prev_run_time, starved_count;    /* how often starve mode was entered */
+      prev_run_time, starved_count,    /* how often starve mode was entered */
+      starved_minimize_count;          /* how often the queue was minimized */
 
   struct mopt_adaptive mopt_adaptive;
 
@@ -664,6 +692,7 @@ typedef struct afl_state {
   u8 chown_needed;             /* Group owner of files needs to be modified */
 
   u32 hang_tmout,                       /* Timeout used for hang det (ms)   */
+      exec_tmout_ceil,                  /* -t <n>+ ceiling, 0 if not given  */
       stats_update_freq;                /* Stats update frequency (execs)   */
 
   u8 havoc_stack_pow2,                  /* HAVOC_STACK_POW2                 */
@@ -679,6 +708,7 @@ typedef struct afl_state {
       fuzz_mode,          /* coverage/exploration or crash/exploitation mode */
       schedule,                         /* Power schedule (default: EXPLORE)*/
       saved_schedule,                   /* saved power schedule             */
+      coe_mu_cached,                   /* coe_fuzz_mu valid this build?     */
       havoc_max_mult,                   /* havoc multiplier                 */
       skip_deterministic,               /* Skip deterministic stages?       */
       use_splicing,                     /* Recombine input files?           */
@@ -712,11 +742,17 @@ typedef struct afl_state {
       old_seed_selection,               /* use vanilla afl seed selection   */
       reinit_table,                     /* reinit the queue weight table    */
       starved,                          /* no finds for some time           */
+      starve_minimize,       /* starved: 1 rescore, 2 minimize queue, 3 done */
       prefer_unfuzzed;            /* fuzz unfuzzed entries before starving  */
 
   u8 *virgin_bits,                      /* Regions yet untouched by fuzzing */
       *virgin_tmout,                    /* Bits we haven't seen in tmouts   */
       *virgin_crash;                    /* Bits we haven't seen in crashes  */
+
+  u8 *virgin_undo;              /* virgin_bits before the pending discovery */
+  u8 *virgin_reclaim;                  /* handbacks per byte, see rollback  */
+  u8  virgin_undo_armed;                /* a discovery may still be undone  */
+  u8  virgin_undo_valid;               /* virgin_undo holds a usable copy   */
 
   double *alias_probability;            /* alias weighted probabilities     */
   u32    *alias_table;                /* alias weighted random lookup table */
@@ -726,6 +762,9 @@ typedef struct afl_state {
   u32     splice_buf_count;           /* number of splice candidates        */
   u32     splice_buf_alloc;           /* allocated capacity of splice_buf   */
   u32     active_items;                 /* enabled entries in the queue     */
+  u32     disabled_items;               /* disabled entries in the queue    */
+
+  long double coe_fuzz_mu;              /* COE mean log2(n_fuzz) of queue   */
 
   u8 *var_bytes;                        /* Bytes that appear to be variable */
 
@@ -781,6 +820,7 @@ typedef struct afl_state {
       det_start_execs,                  /* deterministic fuzzing start execs*/
       last_crash_time,                  /* Time for most recent crash (ms)  */
       last_hang_time,                   /* Time for most recent hang (ms)   */
+      last_tmout_probe,                 /* Last -t <n>+ probe (ms)          */
       longest_find_time,                /* Longest time taken for a find    */
       exit_on_time,                     /* Delay to exit if no new paths    */
       sync_time,                        /* Sync time (ms)                   */
@@ -889,6 +929,18 @@ typedef struct afl_state {
 
   struct cmp_pass_stat    *pass_stats;
   struct cmp_map_snapshot *orig_cmp_map;
+
+  /* Value profiling */
+  u8  value_profile_mode;              /* 0=off, 1=always, 2=stagnation     */
+  u32 value_profile_stagnation_secs;   /* Stagnation threshold (seconds)    */
+  u8  value_profile_active;            /* Currently active?                 */
+  u8  value_profile_suppressed;        /* Temporarily skip runtime collect  */
+  u64 value_profile_finds;             /* Inputs saved via value profiling  */
+  u64 vp_start_time;                   /* Time VP first became active (ms)  */
+  u32 value_profile_replay_idx;        /* Next queue index to replay when   */
+                                     /* stagnation mode first activates VP */
+  vp_frontier_entry_t *vp_frontier;    /* Frontier slots                    */
+  u8 vp_delayed_evictions_pending;     /* VP-only disables due next cycle   */
 
   u8 describe_op_buf_256[256]; /* describe_op will use this to return a string
                                   up to 256 */
@@ -1335,7 +1387,7 @@ void read_afl_environment(afl_state_t *, char **);
 void setup_custom_mutators(afl_state_t *);
 void destroy_custom_mutators(afl_state_t *);
 u8   trim_case_custom(afl_state_t *, struct queue_entry *q, u8 *in_buf,
-                      struct custom_mutator *mutator);
+                      struct custom_mutator *mutator, vp_trim_hooks_t *vp_hooks);
 u8   run_afl_custom_queue_new_entry(afl_state_t *, struct queue_entry *, u8 *,
                                     u8 *);
 
@@ -1369,6 +1421,7 @@ u8   add_to_queue(afl_state_t *, u8 *, u32, u8);
 void destroy_queue(afl_state_t *);
 void update_bitmap_score(afl_state_t *, struct queue_entry *, bool);
 void cull_queue(afl_state_t *);
+void vp_mark_favored_queue_entry(afl_state_t *, struct queue_entry *);
 u32  calculate_score(afl_state_t *, struct queue_entry *);
 void consume_handicap(afl_state_t *, struct queue_entry *);
 
@@ -1389,8 +1442,12 @@ void minimize_bits(afl_state_t *, u8 *, u8 *);
 #ifndef SIMPLE_FILES
 u8 *describe_op(afl_state_t *, u8, size_t);
 #endif
-u8 save_if_interesting(afl_state_t *, void *, u32, u8);
-u8 has_new_bits(afl_state_t *, u8 *);
+u8   save_if_interesting(afl_state_t *, void *, u32, u8);
+u8   has_new_bits(afl_state_t *, u8 *);
+void virgin_undo_arm(afl_state_t *);
+void virgin_undo_save(afl_state_t *);
+void virgin_undo_commit(afl_state_t *);
+void virgin_undo_rollback(afl_state_t *, struct queue_entry *);
 #ifndef AFL_SHOWMAP
 void classify_counts(afl_forkserver_t *);
 #endif
@@ -1402,6 +1459,56 @@ void afl_modmap_init(afl_state_t *);
 void afl_dump_pc_map(afl_state_t *);
 void afl_dump_module_map(afl_state_t *);
 #endif
+
+/* Value profiling (afl-fuzz-valprof.c) */
+
+void vp_note_activation(afl_state_t *, u64);
+void vp_restore_resume_state(afl_state_t *);
+void vp_update_activation(afl_state_t *);
+void vp_frontier_apply(afl_state_t *, struct queue_entry *);
+u8   vp_frontier_would_improve(afl_state_t *);
+void vp_disable_unowned_entry(afl_state_t *, struct queue_entry *);
+void vp_coverage_owner_released(afl_state_t *, struct queue_entry *);
+u8   vp_try_disable_coverage_duplicate(afl_state_t *, struct queue_entry *);
+vp_trim_guard_t *vp_trim_guard_init(afl_state_t *, struct queue_entry *);
+void             vp_trim_guard_before_exec(vp_trim_guard_t *);
+u8               vp_trim_guard_preserved(vp_trim_guard_t *);
+void             vp_trim_guard_after_exec(vp_trim_guard_t *);
+void             vp_trim_guard_destroy(vp_trim_guard_t *);
+void             vp_apply_delayed_evictions(afl_state_t *);
+u8               vp_collect_signal_for_input(afl_state_t *, u8 *, u32);
+void             vp_mark_entry_vp_only(afl_state_t *, struct queue_entry *);
+void vp_persist_disabled_marker(afl_state_t *, struct queue_entry *);
+void vp_restore_queue_entry_state(afl_state_t *, struct queue_entry *,
+                                  const char *);
+void vp_prepare_exec(afl_state_t *, afl_forkserver_t *);
+void vp_runtime_set_site_filter(afl_state_t *, const u16 *, u32);
+void vp_runtime_clear_site_filter(afl_state_t *);
+u8   vp_runtime_observe_begin(afl_state_t *, const u16 *, u32, vp_site_t *);
+void vp_runtime_observe_end(afl_state_t *, const u16 *, u32, const vp_site_t *);
+
+static inline u8 vp_queue_has_unresolved_work(const struct queue_entry *q) {
+
+  return (u8)(q && q->vp_unresolved_ref_cnt);
+
+}
+
+static inline u8 vp_env_arm(afl_state_t *afl) {
+
+  if (unlikely(!afl || !afl->value_profile_mode || afl->non_instrumented_mode ||
+               !afl->shm.vp_mode || !afl->shm.vp_map))
+    return 0;
+
+  afl_shm_vp_env_set(&afl->shm);
+  return 1;
+
+}
+
+static inline void vp_env_disarm(void) {
+
+  afl_shm_vp_env_unset();
+
+}
 
 /* Extras */
 
