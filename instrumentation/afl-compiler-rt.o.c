@@ -51,6 +51,11 @@ __attribute__((weak)) void __sanitizer_symbolize_pc(void *, const char *fmt,
   #include <execinfo.h>
 #endif
 
+/* FreeBSD, as of FreeBSD 15.1, has no support for MAP_NORESERVE for mmap */
+#ifndef MAP_NORESERVE
+  #define MAP_NORESERVE 0
+#endif
+
 #define XXH_INLINE_ALL
 #include "xxhash.h"
 #undef XXH_INLINE_ALL
@@ -230,6 +235,8 @@ u64 *__afl_ijon_bits = __afl_ijon_initial;  // Initial buffer, will point to
 u32 __afl_ijon_map_size = MAP_SIZE_IJON_ENTRIES;
 u32 __afl_ijon_map_increased = 0;
 u32 __afl_ijon_enabled __attribute__((weak)) = 0;
+
+u32 __afl_c11_enabled __attribute__((weak)) = 0;
 
 /* Bug-pass runtime globals (afl-llvm-bug-pass.so support) */
 #include "../include/bug-pass.h"
@@ -821,6 +828,8 @@ static void __afl_map_shm(void) {
     __afl_ijon_map_increased = 1;
 
   }
+
+  if (getenv("AFL_NO_C11")) { __afl_c11_enabled = 0; }
 
   char *id_str = getenv(SHM_ENV_VAR);
 
@@ -1445,6 +1454,8 @@ static void __afl_start_forkserver(void) {
 
   void (*old_sigchld_handler)(int) = signal(SIGCHLD, SIG_DFL);
 
+  if (getenv("AFL_NO_C11")) { __afl_c11_enabled = 0; }
+
   if (getenv("AFL_NO_IJON")) {
 
     __afl_ijon_enabled = 0;
@@ -1557,6 +1568,9 @@ static void __afl_start_forkserver(void) {
 
     /* Add IJON capability flag if IJON is enabled */
     if (__afl_ijon_enabled) { status |= FS_OPT_IJON; }
+
+    /* Add C11 capability flag if C11 is enabled */
+    if (__afl_c11_enabled) { status |= FS_OPT_C11; }
 
     /* Signal that the last MAP_SIZE_BUG_BYTES of trace_bits are the bug
        map, not coverage.  The fuzzer subtracts this in
@@ -2185,16 +2199,8 @@ void __sanitizer_cov_trace_pc_guard(uint32_t *guard) {
 
   */
 
-#if (LLVM_VERSION_MAJOR < 9)
-
-  __afl_area_ptr[*guard]++;
-
-#else
-
   __afl_area_ptr[*guard] =
       __afl_area_ptr[*guard] + 1 + (__afl_area_ptr[*guard] == 255 ? 1 : 0);
-
-#endif
 
 }
 
