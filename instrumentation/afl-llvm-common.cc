@@ -23,6 +23,7 @@
 #include <fnmatch.h>
 
 #include <list>
+#include <set>
 #include <string>
 #include <fstream>
 #include <cmath>
@@ -31,8 +32,12 @@
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/MDBuilder.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Demangle/Demangle.h"
+#include "llvm/Support/JSON.h"
+#include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Transforms/Utils/BasicBlockUtils.h"
 
 #define IS_EXTERN extern
 #include "afl-llvm-common.h"
@@ -43,6 +48,35 @@ static std::list<std::string> allowListFiles;
 static std::list<std::string> allowListFunctions;
 static std::list<std::string> denyListFiles;
 static std::list<std::string> denyListFunctions;
+static std::set<std::string>  allowListFunctionsNoHash;
+static std::set<std::string>  denyListFunctionsNoHash;
+
+static std::string stripRustHash(const std::string &name) {
+
+  const size_t tail = 20;
+  if (name.size() > tail && name.back() == 'E' &&
+      name.compare(name.size() - tail, 3, "17h") == 0) {
+
+    bool hex = true;
+    for (size_t i = name.size() - 17; i + 1 < name.size(); ++i) {
+
+      char ch = name[i];
+      if (!((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f'))) {
+
+        hex = false;
+        break;
+
+      }
+
+    }
+
+    if (hex) return name.substr(0, name.size() - tail);
+
+  }
+
+  return name;
+
+}
 
 unsigned int calcCyclomaticComplexity(llvm::Function *F) {
 
@@ -264,8 +298,13 @@ void initInstrumentList() {
 
         if (is_file == 1)
           allowListFiles.push_back(line);
-        else
+        else {
+
           allowListFunctions.push_back(line);
+          std::string nh = stripRustHash(line);
+          if (nh != line) allowListFunctionsNoHash.insert(nh);
+
+        }
 
       }
 
@@ -339,8 +378,13 @@ void initInstrumentList() {
 
         if (is_file == 1)
           denyListFiles.push_back(line);
-        else
+        else {
+
           denyListFunctions.push_back(line);
+          std::string nh = stripRustHash(line);
+          if (nh != line) denyListFunctionsNoHash.insert(nh);
+
+        }
 
       }
 
@@ -464,6 +508,15 @@ static std::string getSourceName(llvm::Function *F) {
 
 }
 
+/* Returns true if an AFL_LLVM_ALLOWLIST or AFL_LLVM_DENYLIST is in effect,
+   i.e. at least one allow/deny file or function entry was loaded. */
+bool isInstrumentListActive(void) {
+
+  return !allowListFiles.empty() || !allowListFunctions.empty() ||
+         !denyListFiles.empty() || !denyListFunctions.empty();
+
+}
+
 bool isInInstrumentList(llvm::Function *F, std::string Filename) {
 
   bool return_default = true;
@@ -479,6 +532,19 @@ bool isInInstrumentList(llvm::Function *F, std::string Filename) {
 
       std::string instFunction = F->getName().str();
       std::string demangledFunction = llvm::demangle(instFunction);
+      std::string noHashFunction = stripRustHash(instFunction);
+
+      if (noHashFunction != instFunction &&
+          denyListFunctionsNoHash.count(noHashFunction)) {
+
+        if (debug)
+          DEBUGF(
+              "Function %s is in the deny function list, not instrumenting "
+              "... \n",
+              instFunction.c_str());
+        return false;
+
+      }
 
       for (std::list<std::string>::iterator it = denyListFunctions.begin();
            it != denyListFunctions.end(); ++it) {
@@ -557,6 +623,19 @@ bool isInInstrumentList(llvm::Function *F, std::string Filename) {
 
       std::string instFunction = F->getName().str();
       std::string demangledFunction = llvm::demangle(instFunction);
+      std::string noHashFunction = stripRustHash(instFunction);
+
+      if (noHashFunction != instFunction &&
+          allowListFunctionsNoHash.count(noHashFunction)) {
+
+        if (debug)
+          DEBUGF(
+              "Function %s is in the allow function list, instrumenting "
+              "... \n",
+              instFunction.c_str());
+        return true;
+
+      }
 
       for (std::list<std::string>::iterator it = allowListFunctions.begin();
            it != allowListFunctions.end(); ++it) {
@@ -905,6 +984,163 @@ void createC11EnabledGlobal(Module &M, Type *Int32Ty) {
   auto *GV = new GlobalVariable(M, Int32Ty, false, GlobalValue::ExternalLinkage,
                                 One32, "__afl_c11_enabled");
   GV->setComdat(M.getOrInsertComdat("__afl_c11_enabled"));
+
+}
+
+bool setupReachability(StringMap<uint32_t> &values, const char *passName) {
+
+  const char *reachability_file = getenv("AFL_LLVM_REACHABILITY");
+  if (!reachability_file) return false;
+
+  if (getenv("AFL_LLVM_C11")) {
+
+    FATAL(
+        "AFL_LLVM_C11 and AFL_LLVM_REACHABILITY are mutually exclusive - "
+        "they write to the same map slot. Set only one of them.");
+
+  }
+
+  if (!be_quiet) {
+
+    SAYF(cCYA "%s" VERSION cRST " (REACHABILITY mode: %s)\n", passName,
+         reachability_file);
+
+  }
+
+  auto BufOrErr = MemoryBuffer::getFile(reachability_file);
+  if (!BufOrErr) {
+
+    FATAL("AFL_LLVM_REACHABILITY: cannot read json file '%s': %s",
+          reachability_file, BufOrErr.getError().message().c_str());
+
+  }
+
+  Expected<json::Value> Parsed = json::parse((*BufOrErr)->getBuffer());
+  json::Object         *Root = Parsed ? Parsed->getAsObject() : nullptr;
+  json::Array *Reachable = Root ? Root->getArray("reachable") : nullptr;
+
+  if (!Parsed) {
+
+    WARNF("AFL_LLVM_REACHABILITY: ignoring json file '%s', cannot parse: %s",
+          reachability_file, toString(Parsed.takeError()).c_str());
+
+  } else if (!Reachable) {
+
+    WARNF(
+        "AFL_LLVM_REACHABILITY: ignoring json file '%s', no \"reachable\" "
+        "array.",
+        reachability_file);
+
+  }
+
+  if (Reachable) {
+
+    for (json::Value &Item : *Reachable) {
+
+      json::Object *Obj = Item.getAsObject();
+      if (!Obj) continue;
+      std::optional<StringRef> Mangled = Obj->getString("mangled");
+      if (!Mangled) continue;
+
+      bool    interesting = Obj->getBoolean("interesting").value_or(false);
+      bool    bottleneck = Obj->getBoolean("bottleneck").value_or(false);
+      bool    dead_end = Obj->getBoolean("dead_end").value_or(false);
+      int64_t depth = Obj->getInteger("depth").value_or(0);
+
+      uint32_t value;
+      if (!interesting || dead_end) {
+
+        value = 0;
+
+      } else if (bottleneck) {
+
+        value = (uint32_t)(depth + 4);
+
+      } else {
+
+        value = (uint32_t)depth;
+
+      }
+
+      values[*Mangled] = value;
+
+    }
+
+  }
+
+  return true;
+
+}
+
+uint32_t getReachabilityValue(const StringMap<uint32_t> &values,
+                              const Function            &F) {
+
+  auto it = values.find(F.getName());
+  if (it == values.end()) return 0;
+  return it->second;
+
+}
+
+static void reachSetNoInstrument(Value *V) {
+
+  if (auto *I = dyn_cast<Instruction>(V)) {
+
+    I->setMetadata("afl.skip", MDNode::get(I->getContext(), {}));
+    setNoSanitizeMetadata(I);
+
+  }
+
+}
+
+void instrumentReachability(Function &F, uint32_t value) {
+
+  if (value < 4) return;
+
+  Module      &M = *F.getParent();
+  LLVMContext &Ctx = M.getContext();
+  Type        *I8Ty = Type::getInt8Ty(Ctx);
+  Type        *I32Ty = Type::getInt32Ty(Ctx);
+
+#if LLVM_VERSION_MAJOR >= 20
+  Type *PtrTy = PointerType::getUnqual(Ctx);
+  Type *I32PtrTy = PtrTy;
+#else
+  Type *PtrTy = PointerType::get(I8Ty, 0);
+  Type *I32PtrTy = PointerType::get(I32Ty, 0);
+#endif
+
+  GlobalVariable *Map = M.getGlobalVariable("__afl_area_ptr");
+  if (!Map)
+    Map = new GlobalVariable(M, PtrTy, false, GlobalValue::ExternalLinkage, 0,
+                             "__afl_area_ptr");
+
+  BasicBlock  &Entry = F.getEntryBlock();
+  Instruction *InsertPt = &*Entry.getFirstInsertionPt();
+  IRBuilder<>  IRB(InsertPt);
+
+  ConstantInt *Val = IRB.getInt32(value);
+
+  LoadInst *Base = IRB.CreateLoad(PtrTy, Map, "reach_base");
+  reachSetNoInstrument(Base);
+  Value *P = IRB.CreateGEP(I8Ty, Base, IRB.getInt64(1), "reach_slot");
+  reachSetNoInstrument(P);
+  Value *P32 = IRB.CreateBitCast(P, I32PtrTy);
+  reachSetNoInstrument(P32);
+
+  LoadInst *Cur = IRB.CreateAlignedLoad(I32Ty, P32, Align(1), "reach_cur");
+  reachSetNoInstrument(Cur);
+
+  Value *Cond = IRB.CreateICmpUGT(Val, Cur, "reach_gt");
+  reachSetNoInstrument(Cond);
+  MDNode      *Unlikely = MDBuilder(Ctx).createBranchWeights(1, 1u << 20);
+  Instruction *Then = SplitBlockAndInsertIfThen(
+      Cond, InsertPt, /*Unreachable=*/false, Unlikely);
+
+  IRB.SetInsertPoint(Then);
+  StoreInst *St = IRB.CreateAlignedStore(Val, P32, Align(1));
+  reachSetNoInstrument(St);
+
+  createC11EnabledGlobal(M, I32Ty);
 
 }
 

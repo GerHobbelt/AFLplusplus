@@ -119,6 +119,7 @@ typedef struct afl_forkserver {
       dev_urandom_fd,                   /* Persistent fd for /dev/urandom   */
 
       dev_null_fd,                      /* Persistent fd for /dev/null      */
+      crash_trace_fd,                   /* AFL_CRASH_TRACES capture fd (-1) */
       fsrv_ctl_fd,                      /* Fork server control pipe (write) */
       fsrv_st_fd;                       /* Fork server status pipe (read)   */
 
@@ -146,6 +147,8 @@ typedef struct afl_forkserver {
 
   bool allow_cores;                   /* allow core files on target crashes */
 
+  s32 last_child_pid;
+
   bool use_shmem_fuzz;                  /* use shared mem for test cases    */
 
   bool support_shmem_fuzz;              /* set by afl-fuzz                  */
@@ -153,10 +156,7 @@ typedef struct afl_forkserver {
   bool use_futex;                       /* usage of futex implementation    */
   bool qemu_bridge;
   u32 *child_sync;                      /* shared word: fuzzer↔child sync   */
-  int  child_sync_shm_id;               /* SysV SHM ID / FD for child_sync  */
-#ifdef USEMMAP
-  char child_sync_shm_file_path[32];    /* Path for shm_open child_sync     */
-#endif
+  u32  child_sync_offset;        /* byte offset of child_sync in trace_bits */
 
   bool use_ijon;                        /* use IJON tracking feature        */
 

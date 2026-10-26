@@ -284,6 +284,8 @@ class ModuleSanitizerCoverageLTO
   std::ofstream                    dFile;
   size_t                           found = 0;
   bool                             deny_exec = false;
+  bool                             reachability_mode = false;
+  StringMap<uint32_t>              reachabilityValues;
   // AFL++ END
 
 };
@@ -658,6 +660,8 @@ bool ModuleSanitizerCoverageLTO::instrumentModule(
 
   skip_nozero = getenv("AFL_LLVM_SKIP_NEVERZERO");
   use_threadsafe_counters = getenv("AFL_LLVM_THREADSAFE_INST");
+
+  reachability_mode = setupReachability(reachabilityValues, "afl-llvm-lto");
 
   if ((ptr = getenv("AFL_LLVM_LTO_STARTID")) != NULL) {
 
@@ -1546,10 +1550,55 @@ static bool isFullPostDominator(const BasicBlock        *BB,
 
 }
 
+static void markPersistentLoopEdges(Function &F) {
+
+  SmallVector<BasicBlock *, 8> edges;
+
+  for (auto &BB : F) {
+
+    bool calls_loop = false;
+    for (auto &IN : BB) {
+
+      CallInst *call = dyn_cast<CallInst>(&IN);
+      if (!call) continue;
+      Function *callee = call->getCalledFunction();
+      if (callee && callee->getName() == "__afl_persistent_loop") {
+
+        calls_loop = true;
+        break;
+
+      }
+
+    }
+
+    if (!calls_loop) continue;
+
+    for (BasicBlock *succ : successors(&BB)) {
+
+      if (succ->getSinglePredecessor() != &BB) continue;
+      Instruction *term = succ->getTerminator();
+      BranchInst  *br = dyn_cast<BranchInst>(term);
+      if (!br || !br->isUnconditional()) continue;
+      if (&*succ->getFirstNonPHIOrDbg() != term) continue;
+      edges.push_back(succ);
+
+    }
+
+  }
+
+  for (BasicBlock *BB : edges)
+    BB->getTerminator()->setMetadata("afl.skip",
+                                     MDNode::get(BB->getContext(), {}));
+
+}
+
 static bool shouldInstrumentBlock(const Function &F, const BasicBlock *BB,
                                   const DominatorTree            *DT,
                                   const PostDominatorTree        *PDT,
                                   const SanitizerCoverageOptions &Options) {
+
+  if (const Instruction *term = BB->getTerminator())
+    if (term->getMetadata("afl.skip")) return false;
 
   // Don't insert coverage for blocks containing nothing but unreachable: we
   // will never call __sanitizer_cov() for them, so counting them in
@@ -1723,9 +1772,18 @@ void ModuleSanitizerCoverageLTO::instrumentFunction(
   if (!isInInstrumentList(&F, FMNAME)) return;
   // AFL++ END
 
+  if (reachability_mode) {
+
+    instrumentReachability(F, getReachabilityValue(reachabilityValues, F));
+
+  }
+
   if (Options.CoverageType >= SanitizerCoverageOptions::SCK_Edge)
     SplitAllCriticalEdges(
         F, CriticalEdgeSplittingOptions().setIgnoreUnreachableDests());
+
+  markPersistentLoopEdges(F);
+
   SmallVector<Instruction *, 8> IndirCalls;
   SmallVector<BasicBlock *, 16> BlocksToInstrument;
 

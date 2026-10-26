@@ -3,7 +3,30 @@
   This is the list of all noteworthy changes made in every public
   release of the tool. See README.md for the general instruction manual.
 
-### Version ++5.02a (dev)
+### Version ++5.03a (dev)
+  - afl-cc
+    - remove classic AFL instrumentation (colliding coverage), as AFL_LLVM_PATH
+      and AFL_LLVM_CALLER replace these mostly and are overall much better
+  - afl-fuzz
+    - fixed SAND and FrameShift issues
+    - enhancements and fixes for cmplog and ijon
+  - afl-cmin (all variants: C, python, bash, awk): empty (0 byte) input files
+    are now skipped
+  - afl-health
+    - more speed, more info
+  - custom_mutators:
+    - removed outdated and pointless radamsa
+
+
+### Version ++5.02c (release)
+  !!! You need to recompile persistent mode/LLVMFuzzerTestOneInput target !!!
+  - afl-health:
+    - new tool: AFL++ campaign health tool checker, much more advanced than
+      afl-whatsup, with tips, analysis and ssh support
+  - afl-fuzz:
+    - Futex implementation missed the clean-up of the shmem
+    - Futex shmem now lives in general shared memory map as by default only
+      32 such regions are supported in MacOS
   - afl-cc:
     - new C11 mode (`AFL_LLVM_C11` at compile time): afl-cc records each
       function's local variable count and afl-fuzz uses it as an extra queue
@@ -21,7 +44,14 @@
       name, and an explicit `fun:` prefix now permits `:` so demangled C++/Rust
       names can be listed. File (`src:`) entries are unchanged and still match
       as a suffix (an implicit leading `*`)
-  - 
+    - AFL_LLVM_CRASHLIST - crash on any function that is marked not to be
+      instrumented but is entered by fuzzing input
+    - bugfix for __AFL_LOOP() that lingered since vanilla afl, first run
+      coverage map would look different to following runs, impacting lots of
+      functionality (minimizing, stability, etc.)
+  - afl-* script tools:
+    - prefer AFL_PATH to find afl-showmap
+  - man pages: fixed the SYNOPSIS and OPTIONS sections for several tools
 
 
 ### Version ++5.01c (release)
@@ -126,6 +156,7 @@
           CmpLog RTN slot keyed by alloc-site. The existing CmpLog
           dictionary mining harvests `computed_size` as a magic constant
           and feeds the producing input bytes back into havoc.
+    - afl-cc command line parsing fix for ijon
   - afl-cmin*:
     - nyx_mode is now working for all minimizer variants
   - afl-showmap:

@@ -42,7 +42,6 @@ __attribute__((weak)) void __sanitizer_symbolize_pc(void *, const char *fmt,
 #include "config.h"
 #include "types.h"
 #include "cmplog.h"
-#include "llvm-alternative-coverage.h"
 #include "afl-ijon-min.h"
 
 /* For backtrace() support in ijon_hashstack */
@@ -203,9 +202,17 @@ static u8  __afl_area_initial[MAP_INITIAL_SIZE];
 static u8 *__afl_area_ptr_dummy = __afl_area_initial;
 static u8 *__afl_area_ptr_backup = __afl_area_initial;
 
-u8        *__afl_area_ptr = __afl_area_initial;
-u8        *__afl_dictionary;
-u32       *__afl_child_sync = NULL;
+u8  *__afl_area_ptr = __afl_area_initial;
+u8  *__afl_dictionary;
+u32 *__afl_child_sync = NULL;
+/* Byte offset of the child_sync word inside the trace_bits shared map (0 if
+   none). */
+static u32 __afl_child_sync_off = 0;
+#ifdef USEMMAP
+/* Actual length we mapped for the trace_bits region (so we can munmap the
+   exact region, which may include the trailing sync word). */
+static size_t __afl_shm_map_len = 0;
+#endif
 u8        *__afl_fuzz_ptr;
 static u32 __afl_fuzz_len_dummy;
 u32       *__afl_fuzz_len = &__afl_fuzz_len_dummy;
@@ -477,30 +484,20 @@ int        __afl_selective_coverage __attribute__((weak));
 int        __afl_selective_coverage_start_off __attribute__((weak));
 static int __afl_selective_coverage_temp = 1;
 
-/* Aligned for use as LLVM vector operands in ngram/K-ctx modes (#1855).
-   Alignment scales with PREV_LOC_T so non-default MAP_SIZE_POW2 stays safe. */
-#define AFL_PREV_LOC_ALIGN (sizeof(PREV_LOC_T) * NGRAM_SIZE_MAX)
-#define AFL_PREV_CALLER_ALIGN (sizeof(PREV_LOC_T) * CTX_MAX_K)
-_Static_assert(AFL_PREV_LOC_ALIGN >= 32,
-               "prev_loc alignment must be >= 32 for default-config compat");
-_Static_assert(AFL_PREV_CALLER_ALIGN >= 64,
-               "prev_caller alignment must be >= 64 for default-config compat");
+/* __afl_prev_loc is the previous-location accumulator used by the gcc plugin
+   instrumentation (__afl_trace). __afl_prev_ctx is the context ID used by the
+   LTO CTX/CALLER instrumentation. */
 #if defined(__ANDROID__) || defined(__HAIKU__) || defined(NO_TLS)
-PREV_LOC_T __afl_prev_loc[NGRAM_SIZE_MAX]
-    __attribute__((aligned(AFL_PREV_LOC_ALIGN)));
-PREV_LOC_T __afl_prev_caller[CTX_MAX_K]
-    __attribute__((aligned(AFL_PREV_CALLER_ALIGN)));
+u32 __afl_prev_loc;
 u32 __afl_prev_ctx;
 #else
-__thread PREV_LOC_T __afl_prev_loc[NGRAM_SIZE_MAX]
-    __attribute__((aligned(AFL_PREV_LOC_ALIGN)));
-__thread PREV_LOC_T __afl_prev_caller[CTX_MAX_K]
-    __attribute__((aligned(AFL_PREV_CALLER_ALIGN)));
+__thread u32 __afl_prev_loc;
 __thread u32 __afl_prev_ctx;
 #endif
 
 struct cmp_map *__afl_cmp_map;
 struct cmp_map *__afl_cmp_map_backup;
+static u8       __afl_cmp_cursor[CMP_MAP_W];
 
 static u8 __afl_cmplog_max_len = 32;  // 16-32
 
@@ -555,8 +552,8 @@ static void at_exit(int signal) {
 
 void __afl_trace(const u32 x) {
 
-  PREV_LOC_T prev = __afl_prev_loc[0];
-  __afl_prev_loc[0] = (x >> 1);
+  u32 prev = __afl_prev_loc;
+  __afl_prev_loc = (x >> 1);
 
   u8 *p = &__afl_area_ptr[prev ^ x];
 
@@ -724,7 +721,7 @@ static void __afl_bug_configure_runtime(void) {
     if (!__afl_bug_map) {
 
       __afl_bug_map = __afl_bug_map_local;
-      memset(__afl_bug_map, 0, MAP_SIZE_BUG_BYTES);
+      memset_noasan(__afl_bug_map, 0, MAP_SIZE_BUG_BYTES);
 
     }
 
@@ -778,7 +775,7 @@ static void __afl_bug_bind_map(void) {
   /* Bug map is the trailing region of trace_bits. */
   __afl_bug_map =
       (u32 *)(void *)(__afl_area_ptr + __afl_map_size - MAP_SIZE_BUG_BYTES);
-  memset(__afl_bug_map, 0, MAP_SIZE_BUG_BYTES);
+  memset_noasan(__afl_bug_map, 0, MAP_SIZE_BUG_BYTES);
 
 }
 
@@ -790,29 +787,15 @@ static void __afl_map_shm(void) {
   __afl_already_initialized_shm = 1;
 
 #if defined(__linux__) || defined(__APPLE__)
+  /* The child_sync word is embedded in the trace_bits shared map. The fuzzer
+     passes its byte offset via AFL_CHILD_SYNC_SHM; the pointer is set once the
+     map is attached below (see __afl_area_ptr_backup). */
+  __afl_child_sync = NULL;
   {
 
-    char *child_sync_shm = getenv("AFL_CHILD_SYNC_SHM");
-    if (child_sync_shm) {
-
-  #ifdef USEMMAP
-      int shm_fd = shm_open(child_sync_shm, O_RDWR, 0600);
-      if (shm_fd != -1) {
-
-        __afl_child_sync = (u32 *)mmap(0, sizeof(u32), PROT_READ | PROT_WRITE,
-                                       MAP_SHARED, shm_fd, 0);
-        if (__afl_child_sync == MAP_FAILED) __afl_child_sync = NULL;
-        close(shm_fd);
-
-      }
-
-  #else
-      int shm_id = atoi(child_sync_shm);
-      __afl_child_sync = (u32 *)shmat(shm_id, NULL, 0);
-      if (__afl_child_sync == (void *)-1) __afl_child_sync = NULL;
-  #endif
-
-    }
+    char *child_sync_off = getenv("AFL_CHILD_SYNC_SHM");
+    __afl_child_sync_off =
+        child_sync_off ? (u32)strtoul(child_sync_off, NULL, 10) : 0;
 
   }
 
@@ -1023,17 +1006,32 @@ static void __afl_map_shm(void) {
 
     }
 
+    /* The fuzzer reserved the child_sync word past the coverage region, so the
+       segment is larger than __afl_map_size; map enough to reach it. */
+    size_t shm_map_len = __afl_map_size;
+  #if defined(__linux__) || defined(__APPLE__)
+    if (__afl_child_sync_off &&
+        __afl_child_sync_off + sizeof(u32) > shm_map_len) {
+
+      shm_map_len = __afl_child_sync_off + sizeof(u32);
+
+    }
+
+  #endif
+
+    __afl_shm_map_len = shm_map_len;
+
     /* map the shared memory segment to the address space of the process */
     if (__afl_map_addr) {
 
       shm_base =
-          mmap((void *)__afl_map_addr, __afl_map_size, PROT_READ | PROT_WRITE,
+          mmap((void *)__afl_map_addr, shm_map_len, PROT_READ | PROT_WRITE,
                MAP_FIXED_NOREPLACE | MAP_SHARED, shm_fd, 0);
 
     } else {
 
-      shm_base = mmap(0, __afl_map_size, PROT_READ | PROT_WRITE, MAP_SHARED,
-                      shm_fd, 0);
+      shm_base =
+          mmap(0, shm_map_len, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
 
     }
 
@@ -1167,6 +1165,19 @@ static void __afl_map_shm(void) {
 
   __afl_area_ptr_backup = __afl_area_ptr;
   __afl_bug_bind_map();
+
+#if defined(__linux__) || defined(__APPLE__)
+  /* The sync word lives in the shared trace_bits map (only valid when we
+     actually attached one, i.e. id_str was present). Derive it from the real
+     map base before any selective-coverage redirection of __afl_area_ptr. */
+  if (__afl_child_sync_off && id_str) {
+
+    __afl_child_sync =
+        (u32 *)(void *)(__afl_area_ptr_backup + __afl_child_sync_off);
+
+  }
+
+#endif
 
   if (__afl_debug) {
 
@@ -1360,13 +1371,19 @@ static void __afl_unmap_shm(void) {
 
 #ifdef USEMMAP
 
-    munmap((void *)__afl_area_ptr, __afl_map_size);
+    /* Unmap exactly what we mapped (may include the trailing child_sync word
+       past __afl_map_size). */
+    munmap((void *)__afl_area_ptr,
+           __afl_shm_map_len ? __afl_shm_map_len : __afl_map_size);
+    __afl_shm_map_len = 0;
 
 #else
 
     shmdt((void *)__afl_area_ptr);
 
 #endif
+
+    __afl_child_sync = NULL;
 
   } else if ((!__afl_area_ptr || __afl_area_ptr == __afl_area_initial) &&
 
@@ -1553,6 +1570,18 @@ static void __afl_start_forkserver(void) {
     // send the set/requested options to forkserver
     status = FS_NEW_OPT_MAPSIZE;  // we always send the map size
     if (__afl_sharedmem_fuzzing) { status |= FS_NEW_OPT_SHDMEM_FUZZ; }
+#if defined(__linux__) || defined(__APPLE__)
+    /* __afl_map_size is final here (coverage + any IJON + any bug map). The
+       fuzzer places the sync word past the whole map, but guard against ever
+       letting it overlap that region: if it would, drop futex sync (fall back
+       to file descriptors) rather than corrupt IJON/bug data. */
+    if (__afl_child_sync && __afl_child_sync_off < __afl_map_size) {
+
+      __afl_child_sync = NULL;
+
+    }
+
+#endif
     if (__afl_child_sync) { status |= FS_NEW_OPT_FUTEX; }
     if (__afl_bug_mode & AFL_BUG_MODE_DERIVE) {
 
@@ -1848,16 +1877,22 @@ int __afl_persistent_loop(unsigned int max_cnt) {
     memset_noasan(__afl_area_ptr, 0, __afl_set_map_size);
     /* Bug map lives past __afl_set_map_size (trailing tail of trace_bits);
        it needs an explicit zero or stale MAX-channel values persist. */
-    if (__afl_bug_map_active && __afl_bug_map &&
-        __afl_bug_map ==
-            (u32 *)(__afl_area_ptr + __afl_map_size - MAP_SIZE_BUG_BYTES)) {
+    if (unlikely(__afl_cmp_map)) {
+
+      memset_noasan(__afl_cmp_cursor, 0, CMP_MAP_W);
+
+    }
+
+    if (unlikely(__afl_bug_map_active && __afl_bug_map &&
+                 __afl_bug_map == (u32 *)(__afl_area_ptr + __afl_map_size -
+                                          MAP_SIZE_BUG_BYTES))) {
 
       memset_noasan(__afl_bug_map, 0, MAP_SIZE_BUG_BYTES);
 
     }
 
     __afl_area_ptr[0] = 1;
-    memset_noasan(__afl_prev_loc, 0, NGRAM_SIZE_MAX * sizeof(PREV_LOC_T));
+    __afl_prev_loc = 0;
     __afl_alloc_persistent_reset(0);
 
     first_pass = 0;
@@ -1986,7 +2021,7 @@ int __afl_persistent_loop(unsigned int max_cnt) {
 
     }
 
-    memset_noasan(__afl_prev_loc, 0, NGRAM_SIZE_MAX * sizeof(PREV_LOC_T));
+    __afl_prev_loc = 0;
 
     return 1;
 
@@ -2928,13 +2963,10 @@ void __cmplog_ins_hook2(uint16_t arg1, uint16_t arg2, uint8_t attr) {
   if (__afl_cmp_map->headers[k].type != CMP_TYPE_INS) {
 
     __afl_cmp_map->headers[k].type = CMP_TYPE_INS;
-    hits = 0;
-    __afl_cmp_map->headers[k].hits = 1;
+    __afl_cmp_map->headers[k].hits = 0;
     __afl_cmp_map->headers[k].shape = 1;
 
   } else {
-
-    hits = __afl_cmp_map->headers[k].hits++;
 
     if (!__afl_cmp_map->headers[k].shape) {
 
@@ -2944,9 +2976,11 @@ void __cmplog_ins_hook2(uint16_t arg1, uint16_t arg2, uint8_t attr) {
 
   }
 
+  hits = cmp_map_reserve(&__afl_cmp_map->headers[k], &__afl_cmp_cursor[k],
+                         CMP_MAP_H);
+
   __afl_cmp_map->headers[k].attribute = attr;
 
-  hits &= CMP_MAP_H - 1;
   __afl_cmp_map->log[k][hits].v0 = arg1;
   __afl_cmp_map->log[k][hits].v1 = arg2;
 
@@ -2967,13 +3001,10 @@ void __cmplog_ins_hook4(uint32_t arg1, uint32_t arg2, uint8_t attr) {
   if (__afl_cmp_map->headers[k].type != CMP_TYPE_INS) {
 
     __afl_cmp_map->headers[k].type = CMP_TYPE_INS;
-    hits = 0;
-    __afl_cmp_map->headers[k].hits = 1;
+    __afl_cmp_map->headers[k].hits = 0;
     __afl_cmp_map->headers[k].shape = 3;
 
   } else {
-
-    hits = __afl_cmp_map->headers[k].hits++;
 
     if (__afl_cmp_map->headers[k].shape < 3) {
 
@@ -2983,9 +3014,11 @@ void __cmplog_ins_hook4(uint32_t arg1, uint32_t arg2, uint8_t attr) {
 
   }
 
+  hits = cmp_map_reserve(&__afl_cmp_map->headers[k], &__afl_cmp_cursor[k],
+                         CMP_MAP_H);
+
   __afl_cmp_map->headers[k].attribute = attr;
 
-  hits &= CMP_MAP_H - 1;
   __afl_cmp_map->log[k][hits].v0 = arg1;
   __afl_cmp_map->log[k][hits].v1 = arg2;
 
@@ -3006,13 +3039,10 @@ void __cmplog_ins_hook8(uint64_t arg1, uint64_t arg2, uint8_t attr) {
   if (__afl_cmp_map->headers[k].type != CMP_TYPE_INS) {
 
     __afl_cmp_map->headers[k].type = CMP_TYPE_INS;
-    hits = 0;
-    __afl_cmp_map->headers[k].hits = 1;
+    __afl_cmp_map->headers[k].hits = 0;
     __afl_cmp_map->headers[k].shape = 7;
 
   } else {
-
-    hits = __afl_cmp_map->headers[k].hits++;
 
     if (__afl_cmp_map->headers[k].shape < 7) {
 
@@ -3022,9 +3052,11 @@ void __cmplog_ins_hook8(uint64_t arg1, uint64_t arg2, uint8_t attr) {
 
   }
 
+  hits = cmp_map_reserve(&__afl_cmp_map->headers[k], &__afl_cmp_cursor[k],
+                         CMP_MAP_H);
+
   __afl_cmp_map->headers[k].attribute = attr;
 
-  hits &= CMP_MAP_H - 1;
   __afl_cmp_map->log[k][hits].v0 = arg1;
   __afl_cmp_map->log[k][hits].v1 = arg2;
 
@@ -3050,13 +3082,10 @@ void __cmplog_ins_hookN(uint128_t arg1, uint128_t arg2, uint8_t attr,
   if (__afl_cmp_map->headers[k].type != CMP_TYPE_INS) {
 
     __afl_cmp_map->headers[k].type = CMP_TYPE_INS;
-    hits = 0;
-    __afl_cmp_map->headers[k].hits = 1;
+    __afl_cmp_map->headers[k].hits = 0;
     __afl_cmp_map->headers[k].shape = size;
 
   } else {
-
-    hits = __afl_cmp_map->headers[k].hits++;
 
     if (__afl_cmp_map->headers[k].shape < size) {
 
@@ -3066,9 +3095,11 @@ void __cmplog_ins_hookN(uint128_t arg1, uint128_t arg2, uint8_t attr,
 
   }
 
+  hits = cmp_map_reserve(&__afl_cmp_map->headers[k], &__afl_cmp_cursor[k],
+                         CMP_MAP_H);
+
   __afl_cmp_map->headers[k].attribute = attr;
 
-  hits &= CMP_MAP_H - 1;
   __afl_cmp_map->log[k][hits].v0 = (u64)arg1;
   __afl_cmp_map->log[k][hits].v1 = (u64)arg2;
 
@@ -3094,13 +3125,10 @@ void __cmplog_ins_hook16(uint128_t arg1, uint128_t arg2, uint8_t attr) {
   if (__afl_cmp_map->headers[k].type != CMP_TYPE_INS) {
 
     __afl_cmp_map->headers[k].type = CMP_TYPE_INS;
-    hits = 0;
-    __afl_cmp_map->headers[k].hits = 1;
+    __afl_cmp_map->headers[k].hits = 0;
     __afl_cmp_map->headers[k].shape = 15;
 
   } else {
-
-    hits = __afl_cmp_map->headers[k].hits++;
 
     if (__afl_cmp_map->headers[k].shape < 15) {
 
@@ -3110,9 +3138,11 @@ void __cmplog_ins_hook16(uint128_t arg1, uint128_t arg2, uint8_t attr) {
 
   }
 
+  hits = cmp_map_reserve(&__afl_cmp_map->headers[k], &__afl_cmp_cursor[k],
+                         CMP_MAP_H);
+
   __afl_cmp_map->headers[k].attribute = attr;
 
-  hits &= CMP_MAP_H - 1;
   __afl_cmp_map->log[k][hits].v0 = (u64)arg1;
   __afl_cmp_map->log[k][hits].v1 = (u64)arg2;
   __afl_cmp_map->log[k][hits].v0_128 = (u64)(arg1 >> 64);
@@ -3200,13 +3230,10 @@ void __sanitizer_cov_trace_switch(uint64_t val, uint64_t *cases) {
     if (__afl_cmp_map->headers[k].type != CMP_TYPE_INS) {
 
       __afl_cmp_map->headers[k].type = CMP_TYPE_INS;
-      hits = 0;
-      __afl_cmp_map->headers[k].hits = 1;
+      __afl_cmp_map->headers[k].hits = 0;
       __afl_cmp_map->headers[k].shape = 7;
 
     } else {
-
-      hits = __afl_cmp_map->headers[k].hits++;
 
       if (__afl_cmp_map->headers[k].shape < 7) {
 
@@ -3216,9 +3243,11 @@ void __sanitizer_cov_trace_switch(uint64_t val, uint64_t *cases) {
 
     }
 
+    hits = cmp_map_reserve(&__afl_cmp_map->headers[k], &__afl_cmp_cursor[k],
+                           CMP_MAP_H);
+
     __afl_cmp_map->headers[k].attribute = 1;
 
-    hits &= CMP_MAP_H - 1;
     __afl_cmp_map->log[k][hits].v0 = val;
     __afl_cmp_map->log[k][hits].v1 = cases[i + 2];
 
@@ -3469,13 +3498,10 @@ void __cmplog_rtn_hook_strn(u8 *ptr1, u8 *ptr2, u64 len) {
   if (__afl_cmp_map->headers[k].type != CMP_TYPE_RTN) {
 
     __afl_cmp_map->headers[k].type = CMP_TYPE_RTN;
-    __afl_cmp_map->headers[k].hits = 1;
+    __afl_cmp_map->headers[k].hits = 0;
     __afl_cmp_map->headers[k].shape = l - 1;
-    hits = 0;
 
   } else {
-
-    hits = __afl_cmp_map->headers[k].hits++;
 
     if (__afl_cmp_map->headers[k].shape < l) {
 
@@ -3485,8 +3511,10 @@ void __cmplog_rtn_hook_strn(u8 *ptr1, u8 *ptr2, u64 len) {
 
   }
 
+  hits = cmp_map_reserve(&__afl_cmp_map->headers[k], &__afl_cmp_cursor[k],
+                         CMP_MAP_RTN_H);
+
   struct cmpfn_operands *cmpfn = (struct cmpfn_operands *)__afl_cmp_map->log[k];
-  hits &= CMP_MAP_RTN_H - 1;
 
   /* Record each operand's own length (like __cmplog_rtn_hook_str does for
      strcmp). The previous code stored MAX(len0,len1) for both, which recorded
@@ -3531,13 +3559,10 @@ void __cmplog_rtn_hook_str(u8 *ptr1, u8 *ptr2) {
   if (__afl_cmp_map->headers[k].type != CMP_TYPE_RTN) {
 
     __afl_cmp_map->headers[k].type = CMP_TYPE_RTN;
-    __afl_cmp_map->headers[k].hits = 1;
+    __afl_cmp_map->headers[k].hits = 0;
     __afl_cmp_map->headers[k].shape = l - 1;
-    hits = 0;
 
   } else {
-
-    hits = __afl_cmp_map->headers[k].hits++;
 
     if (__afl_cmp_map->headers[k].shape < l) {
 
@@ -3547,8 +3572,10 @@ void __cmplog_rtn_hook_str(u8 *ptr1, u8 *ptr2) {
 
   }
 
+  hits = cmp_map_reserve(&__afl_cmp_map->headers[k], &__afl_cmp_cursor[k],
+                         CMP_MAP_RTN_H);
+
   struct cmpfn_operands *cmpfn = (struct cmpfn_operands *)__afl_cmp_map->log[k];
-  hits &= CMP_MAP_RTN_H - 1;
 
   cmpfn[hits].v0_len = 0x80 + len1;
   cmpfn[hits].v1_len = 0x80 + len2;
@@ -3595,13 +3622,10 @@ void __cmplog_rtn_hook(u8 *ptr1, u8 *ptr2) {
   if (__afl_cmp_map->headers[k].type != CMP_TYPE_RTN) {
 
     __afl_cmp_map->headers[k].type = CMP_TYPE_RTN;
-    __afl_cmp_map->headers[k].hits = 1;
+    __afl_cmp_map->headers[k].hits = 0;
     __afl_cmp_map->headers[k].shape = len - 1;
-    hits = 0;
 
   } else {
-
-    hits = __afl_cmp_map->headers[k].hits++;
 
     if (__afl_cmp_map->headers[k].shape < len) {
 
@@ -3611,8 +3635,10 @@ void __cmplog_rtn_hook(u8 *ptr1, u8 *ptr2) {
 
   }
 
+  hits = cmp_map_reserve(&__afl_cmp_map->headers[k], &__afl_cmp_cursor[k],
+                         CMP_MAP_RTN_H);
+
   struct cmpfn_operands *cmpfn = (struct cmpfn_operands *)__afl_cmp_map->log[k];
-  hits &= CMP_MAP_RTN_H - 1;
 
   cmpfn[hits].v0_len = len;
   cmpfn[hits].v1_len = len;
@@ -3905,6 +3931,7 @@ void __afl_coverage_discard() {
   if (__afl_cmp_map) {
 
     memset_noasan(__afl_cmp_map, 0, sizeof(struct cmp_map));
+    memset_noasan(__afl_cmp_cursor, 0, CMP_MAP_W);
 
   }
 
@@ -4968,7 +4995,7 @@ static inline void __afl_alloc_persistent_reset(u8 flush_derive) {
          forkserver already memsets between runs; that case is a no-op. */
   if (__afl_bug_map_active && __afl_bug_map == __afl_bug_map_local) {
 
-    memset(__afl_bug_map_local, 0, MAP_SIZE_BUG_BYTES);
+    memset_noasan(__afl_bug_map_local, 0, MAP_SIZE_BUG_BYTES);
 
   }
 

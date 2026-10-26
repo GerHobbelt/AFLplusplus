@@ -40,10 +40,12 @@ typedef struct sharedmem {
 
 #ifdef USEMMAP
   /* ================ Proteas ================ */
-  int  g_shm_fd;
-  char g_shm_file_path[L_tmpnam];
-  int  cmplog_g_shm_fd;
-  char cmplog_g_shm_file_path[L_tmpnam];
+  int    g_shm_fd;
+  char   g_shm_file_path[L_tmpnam];
+  int    cmplog_g_shm_fd;
+  char   cmplog_g_shm_file_path[L_tmpnam];
+  size_t map_alloc_size;
+  size_t cmp_map_alloc_size;
 /* ========================================= */
 #else
   s32 shm_id;                          /* ID of the SHM region              */
@@ -52,7 +54,13 @@ typedef struct sharedmem {
 
   u8 *map;                                          /* shared memory region */
 
-  size_t map_size;                                 /* actual allocated size */
+  size_t map_size;                                    /* requested map size */
+
+  /* The fuzzer<->child synchronization word lives in the last bytes of the
+     coverage map (see afl_shm_init). child_sync_offset is its byte offset
+     into ->map (0 means none). This avoids a second shared memory segment. */
+  u32  child_sync_offset;           /* offset of child_sync word in map     */
+  u32 *child_sync;                 /* pointer to the 4-byte sync word       */
 
   int             cmplog_mode;
   int             sanfuzz_mode;
