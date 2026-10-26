@@ -98,7 +98,7 @@
    can hope... */
 
 #if defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__) || \
-    defined(__DragonFly__) || defined(__sun)
+    defined(__DragonFly__) || defined(__sun) || defined(__APPLE__)
   #define HAVE_AFFINITY 1
   #if defined(__FreeBSD__) || defined(__DragonFly__)
     #include <sys/param.h>
@@ -117,6 +117,10 @@
     #include <sys/sysinfo.h>
     #include <sys/pset.h>
     #include <strings.h>
+  #elif defined(__APPLE__)
+    #include <pthread.h>
+    #include <mach/mach.h>
+    #include <mach/thread_policy.h>
   #endif
 #endif                                                         /* __linux__ */
 
@@ -241,8 +245,9 @@ struct frameshift_stats {
 
 struct skipdet_entry {
 
-  u8  continue_inf, done_eff;
+  u8  continue_inf, done_eff, eff_probe;
   u32 undet_bits, quick_eff_bytes;
+  u32 eff_cursor;
 
   u8 *skip_eff_map,                     /* we'v finish the eff_map          */
       *done_inf_map;                    /* some bytes are not done yet      */
@@ -255,7 +260,9 @@ struct skipdet_global {
 
   u32 undet_bits_threshold;
 
-  u64 last_cov_undet;
+  u64 last_cov_undet_execs;
+
+  u64 last_cov_undet_time;
 
   u8 *virgin_det_bits;                  /* global fuzzed bits               */
 
@@ -434,6 +441,7 @@ enum {
 #define MOPT_ARM_MIN_SAMPLES 64   /* min execs before an arm can lose       */
 #define MOPT_ARM_DECAY_NUM 50     /* policy window decay (0.50)             */
 #define MOPT_ARM_DECAY_DEN 100
+#define MOPT_FIND_SCALE 4096U
 
 struct mopt_ctx {
 
@@ -458,7 +466,6 @@ struct mopt_adaptive {
   /* per-stacked-round attribution scratch (hot path, tiny).
      use_stacking <= 16 with default HAVOC_STACK_POW2=4; round_list is
      oversized and guarded so a user raising the pow via '+' is still safe. */
-  u8  round_seen[MOPT_OP_MAX];  /* dedup find credit within one round       */
   u8  round_list[64];          /* op ids touched this round                 */
   u32 round_cnt;
 
@@ -569,7 +576,7 @@ typedef struct afl_env_vars {
       afl_custom_mutator_late_send, afl_no_ui, afl_force_ui,
       afl_i_dont_care_about_missing_crashes, afl_bench_just_one,
       afl_bench_until_crash, afl_debug_child, afl_autoresume, afl_cal_fast,
-      afl_cycle_schedules, afl_expand_havoc, afl_statsd, afl_cmplog_only_new,
+      afl_expand_havoc, afl_statsd, afl_cmplog_only_new,
       afl_exit_on_seed_issues, afl_try_affinity, afl_ignore_problems,
       afl_keep_timeouts, afl_no_crash_readme, afl_ignore_timeouts,
       afl_no_startup_calibration, afl_no_warn_instability,
@@ -600,17 +607,20 @@ typedef struct afl_env_vars {
 
 } afl_env_vars_t;
 
-struct afl_pass_stat {
-
-  u8 total;
-  u8 faileds;
-
-};
-
 struct foreign_sync {
 
   u8    *dir;
   time_t mtime;
+
+};
+
+struct sync_peer_state {
+
+  u8 *name;
+  u32 cursor;
+  u32 max_start_id;
+  u8  have_max;
+  u8  loaded;
 
 };
 
@@ -633,7 +643,7 @@ typedef struct afl_state {
   /* Status UI and timing globals where it really makes no sense to haul them
      around as function parameters. */
   u64 most_time_key, most_time, most_execs_key, most_execs, force_ui_update,
-      prev_run_time;
+      prev_run_time, starved_count;    /* how often starve mode was entered */
 
   struct mopt_adaptive mopt_adaptive;
 
@@ -665,11 +675,14 @@ typedef struct afl_state {
       is_secondary_node,                /* if this is a secondary instance  */
       pizza_is_served,                  /* pizza mode                       */
       input_mode,                       /* target wants text inputs         */
+      saved_input_mode,                 /* saved input mode                 */
       fuzz_mode,          /* coverage/exploration or crash/exploitation mode */
       schedule,                         /* Power schedule (default: EXPLORE)*/
+      saved_schedule,                   /* saved power schedule             */
       havoc_max_mult,                   /* havoc multiplier                 */
       skip_deterministic,               /* Skip deterministic stages?       */
       use_splicing,                     /* Recombine input files?           */
+      saved_use_splicing,               /* saved use splicing               */
       non_instrumented_mode,            /* Run in non-instrumented mode?    */
       score_changed,                    /* Scoring for favorites changed?   */
       resuming_fuzz,                    /* Resuming an older fuzzing job?   */
@@ -696,9 +709,10 @@ typedef struct afl_state {
       disable_trim,                     /* Never trim in fuzz_one           */
       shmem_testcase_mode,              /* If sharedmem testcases are used  */
       expand_havoc,                /* perform expensive havoc after no find */
-      cycle_schedules,                  /* cycle power schedules?           */
       old_seed_selection,               /* use vanilla afl seed selection   */
-      reinit_table;                     /* reinit the queue weight table    */
+      reinit_table,                     /* reinit the queue weight table    */
+      starved,                          /* no finds for some time           */
+      prefer_unfuzzed;            /* fuzz unfuzzed entries before starving  */
 
   u8 *virgin_bits,                      /* Regions yet untouched by fuzzing */
       *virgin_tmout,                    /* Bits we haven't seen in tmouts   */
@@ -707,6 +721,7 @@ typedef struct afl_state {
   double *alias_probability;            /* alias weighted probabilities     */
   u32    *alias_table;                /* alias weighted random lookup table */
   u32     alias_map_size;             /* allocated capacity of alias arrays */
+  u32     pending_reinit;
   u32    *splice_buf_ids;             /* pre-filtered splice candidate IDs  */
   u32     splice_buf_count;           /* number of splice candidates        */
   u32     splice_buf_alloc;           /* allocated capacity of splice_buf   */
@@ -759,6 +774,11 @@ typedef struct afl_state {
       last_sync_time,                   /* Time of last sync                */
       last_sync_cycle,                  /* Cycle no. of the last sync       */
       last_find_time,                   /* Time for most recent path (ms)   */
+      last_edge_time,                   /* Time for most recent edge (ms)   */
+      last_find_execs,                  /* last queue item find time        */
+      last_edge_execs,                  /* last time a new edge was found   */
+      det_start_time,                   /* deterministic fuzzing start time */
+      det_start_execs,                  /* deterministic fuzzing start execs*/
       last_crash_time,                  /* Time for most recent crash (ms)  */
       last_hang_time,                   /* Time for most recent hang (ms)   */
       longest_find_time,                /* Longest time taken for a find    */
@@ -769,6 +789,7 @@ typedef struct afl_state {
       sync_time_us,                     /* Time spend on sync               */
       cmplog_time_us,                   /* Time spend on cmplog             */
       trim_time_us,                     /* Time spend on trimming           */
+      table_time_us,                    /* Time spend building alias table  */
       peak_rss_mb;                      /* Peak RSS of the target in MB     */
 
   u32 slowest_exec_ms,                  /* Slowest testcase non hang in ms  */
@@ -783,6 +804,7 @@ typedef struct afl_state {
   u32 stage_cur, stage_max;             /* Stage progression                */
   s32 splicing_with;                    /* Splicing with which test case?   */
   s64 smallest_favored;                 /* smallest queue id favored        */
+  u32 unfuzzed_cursor;              /* monotonic scan hint for prefer mode  */
   s32 afl_ijon_history_limit;           /* IJON history buffer limit        */
 
   u32 main_node_id, main_node_max;      /*   Main instance job splitting    */
@@ -825,8 +847,6 @@ typedef struct afl_state {
 
   struct queue_entry **top_rated;           /* Top entries for bitmap bytes */
 
-  u32 **top_rated_candidates;             /* Candidate IDs per bitmap index */
-
   struct extra_data *extras;            /* Extra tokens to fuzz with        */
   u32                extras_cnt;        /* Total number of tokens read      */
 
@@ -859,14 +879,16 @@ typedef struct afl_state {
   u32 colorize_success;
   u8  cmplog_enable_arith, cmplog_enable_transform, cmplog_enable_scale,
       cmplog_enable_xtreme_transform, cmplog_random_colorization;
+  u8 saved_cmplog_enable_arith;
   u8 cmplog_tightness, cmplog_size_derive;
-  /* Per-cmp-site minimum slack ever seen; UINT64_MAX = unseen. Indexed by
+  /* Per-cmp-site minimum slack and identity; UINT64_MAX = unseen. Indexed by
      cmp_map header key. Lazily allocated on first slack scan. */
   u64 *min_slack;
+  u32 *min_slack_ids;
   u64  cmplog_tightness_new;
 
-  struct afl_pass_stat *pass_stats;
-  struct cmp_map       *orig_cmp_map;
+  struct cmp_pass_stat    *pass_stats;
+  struct cmp_map_snapshot *orig_cmp_map;
 
   u8 describe_op_buf_256[256]; /* describe_op will use this to return a string
                                   up to 256 */
@@ -880,6 +902,9 @@ typedef struct afl_state {
   u8                  foreign_sync_cnt;
   struct foreign_sync foreign_syncs[FOREIGN_SYNCS_MAX];
   char               *foreign_file;
+
+  struct sync_peer_state *sync_states;
+  u32                     sync_states_cnt;
 
 #ifdef _AFL_DOCUMENT_MUTATIONS
   u8  do_document;
@@ -974,11 +999,10 @@ typedef struct afl_state {
 
   struct frameshift_stats fs_stats;
   u32       *frameshift_index_buffer;        /* Buffer for frameshift index */
+  u64        frameshift_deadline;
   fs_meta_t *fs_curr_meta;    /* Metadata for the current input (full copy) */
 
   struct skipdet_global *skipdet_g;
-
-  s64 last_scored_idx;           /* Index of the last queue entry re-scored */
 
 #ifdef INTROSPECTION
   char  mutation[8072];
@@ -1346,8 +1370,7 @@ void destroy_queue(afl_state_t *);
 void update_bitmap_score(afl_state_t *, struct queue_entry *, bool);
 void cull_queue(afl_state_t *);
 u32  calculate_score(afl_state_t *, struct queue_entry *);
-void recalculate_all_scores(afl_state_t *);
-void update_bitmap_rescore(afl_state_t *, struct queue_entry *, u32);
+void consume_handicap(afl_state_t *, struct queue_entry *);
 
 /* Bitmap */
 
@@ -1409,6 +1432,7 @@ void update_calibration_time(afl_state_t *afl, u64 *time);
 void update_trim_time(afl_state_t *afl, u64 *time);
 void update_sync_time(afl_state_t *afl, u64 *time);
 void update_cmplog_time(afl_state_t *afl, u64 *time);
+void update_table_time(afl_state_t *afl, u64 *time);
 
 /* StatsD */
 
@@ -1492,8 +1516,8 @@ double rand_next_percent(afl_state_t *afl);
 
 /* SkipDet Functions */
 
-u8 skip_deterministic_stage(afl_state_t *, u8 *, u8 *, u32, u64);
-u8 is_det_timeout(u64, u8);
+u8 skip_deterministic_stage(afl_state_t *, u8 *, u8 *, u32);
+u8 is_det_timeout(afl_state_t *, u8);
 
 /* afl-fuzz-mopt-adaptive.c */
 void       mopt_adaptive_init(afl_state_t *);
@@ -1524,8 +1548,8 @@ void fs_clone_meta(afl_state_t *afl);
 
 /**** Inline routines ****/
 
-/* Generate a random number (from 0 to limit - 1). This may
-   have slight bias. */
+/* Generate a random number (from 0 to limit - 1), uniformly
+   distributed. */
 
 static inline u32 rand_below(afl_state_t *afl, u32 limit) {
 
@@ -1541,18 +1565,52 @@ static inline u32 rand_below(afl_state_t *afl, u32 limit) {
 
   }
 
-  /* Modulo is biased - we don't want our fuzzing to be biased so let's do it
-   right. See:
-   https://stackoverflow.com/questions/10984974/why-do-people-say-there-is-modulo-bias-when-using-a-random-number-generator
+  /* Lemire's nearly-divisionless bounded reduction: map the random value into
+     "limit" equal buckets with a widening multiply and reject only the values
+     that would land in the single oversized bucket. Uniform, like a modulo
+     reduction, but the division is taken on the near-never rejection path
+     instead of twice on every call. See:
+     https://lemire.me/blog/2019/06/06/nearly-divisionless-random-integer-generation-on-various-systems/
    */
-  u64 unbiased_rnd;
-  do {
+#ifdef WORD_SIZE_64
+  u64       x = rand_next(afl);
+  uint128_t m = (uint128_t)x * (uint128_t)limit;
+  u64       l = (u64)m;
 
-    unbiased_rnd = rand_next(afl);
+  if (unlikely(l < limit)) {
 
-  } while (unlikely(unbiased_rnd >= (UINT64_MAX - (UINT64_MAX % limit))));
+    u64 t = (0 - (u64)limit) % limit;
+    while (l < t) {
 
-  return unbiased_rnd % limit;
+      x = rand_next(afl);
+      m = (uint128_t)x * (uint128_t)limit;
+      l = (u64)m;
+
+    }
+
+  }
+
+  return (u32)(m >> 64);
+#else
+  u32 x = rand_next(afl);
+  u64 m = (u64)x * (u64)limit;
+  u32 l = (u32)m;
+
+  if (unlikely(l < limit)) {
+
+    u32 t = (0 - limit) % limit;
+    while (l < t) {
+
+      x = rand_next(afl);
+      m = (u64)x * (u64)limit;
+      l = (u32)m;
+
+    }
+
+  }
+
+  return (u32)(m >> 32);
+#endif
 
 }
 
@@ -1646,7 +1704,7 @@ static inline int permissive_create(afl_state_t *afl, const char *fn) {
 
   }
 
-  if (afl->chown_needed) {
+  if (fd >= 0 && afl->chown_needed) {
 
     if (fchown(fd, -1, afl->fsrv.gid) == -1) { PFATAL("fchown() failed"); }
 

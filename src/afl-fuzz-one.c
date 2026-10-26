@@ -198,8 +198,8 @@ static u8 could_be_interest(u32 old_val, u32 new_val, u8 blen, u8 check_le) {
 
     for (j = 0; j < sizeof(interesting_8); ++j) {
 
-      u32 tval =
-          (old_val & ~(0xff << (i * 8))) | (((u8)interesting_8[j]) << (i * 8));
+      u32 tval = (old_val & ~(0xffU << (i * 8))) |
+                 ((u32)(u8)interesting_8[j] << (i * 8));
 
       if (new_val == tval) { return 1; }
 
@@ -218,8 +218,8 @@ static u8 could_be_interest(u32 old_val, u32 new_val, u8 blen, u8 check_le) {
 
     for (j = 0; j < sizeof(interesting_16) / 2; ++j) {
 
-      u32 tval = (old_val & ~(0xffff << (i * 8))) |
-                 (((u16)interesting_16[j]) << (i * 8));
+      u32 tval = (old_val & ~(0xffffU << (i * 8))) |
+                 ((u32)(u16)interesting_16[j] << (i * 8));
 
       if (new_val == tval) { return 1; }
 
@@ -227,8 +227,8 @@ static u8 could_be_interest(u32 old_val, u32 new_val, u8 blen, u8 check_le) {
 
       if (blen > 2) {
 
-        tval = (old_val & ~(0xffff << (i * 8))) |
-               (SWAP16(interesting_16[j]) << (i * 8));
+        tval = (old_val & ~(0xffffU << (i * 8))) |
+               ((u32)SWAP16(interesting_16[j]) << (i * 8));
 
         if (new_val == tval) { return 1; }
 
@@ -396,7 +396,7 @@ u8 fuzz_one(afl_state_t *afl) {
 
   } else if (!afl->non_instrumented_mode && !afl->queue_cur->favored &&
 
-             afl->queued_items > 10) {
+             !afl->prefer_unfuzzed && afl->queued_items > 10) {
 
     /* Otherwise, still possibly skip non-favored cases, albeit less often.
        The odds of skipping stuff are higher for already-fuzzed inputs and
@@ -592,16 +592,10 @@ u8 fuzz_one(afl_state_t *afl) {
 
     if (unlikely(afl->queue_cur->fs_status == 0)) {
 
-      /* FrameShift has not run on this input. */
-
-      /* Check frameshift overhead budget before running analysis.
-         Use total runtime since start as the reference. */
-      u64 total_runtime_ms =
-          afl->prev_run_time + get_cur_time() - afl->start_time;
-      double max_overhead = afl->afl_env.afl_frameshift_max_overhead;
-      u64    allowed_ms = (u64)((double)total_runtime_ms * max_overhead);
-
-      if (afl->fs_stats.total_time_ms <= allowed_ms) { frameshift_stage(afl); }
+      /* FrameShift has not run on this input; the stage gates admission on the
+         cumulative overhead budget, then analyses the input with the full
+         per-input time budget. */
+      frameshift_stage(afl);
 
     }
 
@@ -627,6 +621,26 @@ u8 fuzz_one(afl_state_t *afl) {
 
   }
 
+  if (unlikely(afl->queue_cur->handicap)) {
+
+    if (afl->queue_cur->handicap >= 4) {
+
+      afl->queue_cur->handicap -= 4;
+
+    } else {
+
+      --afl->queue_cur->handicap;
+
+    }
+
+    if (unlikely(++afl->pending_reinit > (afl->active_items >> 3))) {
+
+      afl->reinit_table = 1;
+
+    }
+
+  }
+
   if (unlikely(afl->shm.cmplog_mode &&
                afl->queue_cur->colorized < afl->cmplog_lvl &&
                (u32)len <= afl->cmplog_max_filesize)) {
@@ -641,7 +655,8 @@ u8 fuzz_one(afl_state_t *afl) {
           (afl->cmplog_lvl == 2 &&
            (afl->queue_cur->tc_ref ||
             afl->fsrv.total_execs % afl->queued_items <= 10)) ||
-          get_cur_time() - afl->last_find_time > 250000) {  // 250 seconds
+          (!afl->pending_favored &&
+           afl->fsrv.total_execs - afl->last_edge_execs >= CMPLOG_I2S_EXECS)) {
 
         if (input_to_state_stage(afl, in_buf, out_buf, len)) {
 
@@ -656,6 +671,8 @@ u8 fuzz_one(afl_state_t *afl) {
   }
 
   u64 before_det_time = get_cur_time();
+  afl->det_start_time = before_det_time;
+  afl->det_start_execs = afl->fsrv.total_execs;
 #ifdef INTROSPECTION
 
   u64 before_havoc_time;
@@ -667,7 +684,7 @@ u8 fuzz_one(afl_state_t *afl) {
 #endif
   if (!afl->skip_deterministic) {
 
-    if (!skip_deterministic_stage(afl, in_buf, out_buf, len, before_det_time)) {
+    if (!skip_deterministic_stage(afl, in_buf, out_buf, len)) {
 
       goto abandon_entry;
 
@@ -684,7 +701,9 @@ u8 fuzz_one(afl_state_t *afl) {
   /* if skipdet decide to skip the seed or no interesting bytes found,
      we skip the whole deterministic stage as well */
 
-  if (likely(afl->skip_deterministic) || likely(afl->queue_cur->passed_det) ||
+  if (likely(afl->skip_deterministic) ||
+      likely(!afl->queue_cur->skipdet_e->done_eff) ||
+      likely(afl->queue_cur->passed_det) ||
       likely(!afl->queue_cur->skipdet_e->quick_eff_bytes) ||
       likely(perf_score <
              (afl->queue_cur->depth * 30 <= afl->havoc_max_mult * 100
@@ -746,7 +765,7 @@ u8 fuzz_one(afl_state_t *afl) {
 
     if (!bitmap_read(skip_eff_map, afl->stage_cur_byte)) continue;
 
-    if (is_det_timeout(before_det_time, 0)) { goto custom_mutator_stage; }
+    if (is_det_timeout(afl, 0)) { goto custom_mutator_stage; }
 
     FLIP_BIT(out_buf, afl->stage_cur);
 
@@ -866,7 +885,7 @@ u8 fuzz_one(afl_state_t *afl) {
 
     if (!bitmap_read(skip_eff_map, afl->stage_cur_byte)) continue;
 
-    if (is_det_timeout(before_det_time, 0)) { goto custom_mutator_stage; }
+    if (is_det_timeout(afl, 0)) { goto custom_mutator_stage; }
 
     FLIP_BIT(out_buf, afl->stage_cur);
     FLIP_BIT(out_buf, afl->stage_cur + 1);
@@ -905,7 +924,7 @@ u8 fuzz_one(afl_state_t *afl) {
 
     if (!bitmap_read(skip_eff_map, afl->stage_cur_byte)) continue;
 
-    if (is_det_timeout(before_det_time, 0)) { goto custom_mutator_stage; }
+    if (is_det_timeout(afl, 0)) { goto custom_mutator_stage; }
 
     FLIP_BIT(out_buf, afl->stage_cur);
     FLIP_BIT(out_buf, afl->stage_cur + 1);
@@ -949,7 +968,7 @@ u8 fuzz_one(afl_state_t *afl) {
 
     if (!bitmap_read(skip_eff_map, afl->stage_cur_byte)) continue;
 
-    if (is_det_timeout(before_det_time, 0)) { goto custom_mutator_stage; }
+    if (is_det_timeout(afl, 0)) { goto custom_mutator_stage; }
 
     out_buf[afl->stage_cur] ^= 0xFF;
 
@@ -999,11 +1018,11 @@ u8 fuzz_one(afl_state_t *afl) {
 
     if (!bitmap_read(skip_eff_map, i)) continue;
 
-    if (is_det_timeout(before_det_time, 0)) { goto custom_mutator_stage; }
+    if (is_det_timeout(afl, 0)) { goto custom_mutator_stage; }
 
     afl->stage_cur_byte = i;
 
-    *(u16 *)(out_buf + i) ^= 0xFFFF;
+    INSERT16(out_buf, i, EXTRACT16(out_buf, i) ^ 0xFFFF);
 
 #ifdef INTROSPECTION
     snprintf(afl->mutation, sizeof(afl->mutation), "%s FLIP_BIT16-%u",
@@ -1013,7 +1032,7 @@ u8 fuzz_one(afl_state_t *afl) {
     if (common_fuzz_stuff(afl, out_buf, len)) { goto abandon_entry; }
     ++afl->stage_cur;
 
-    *(u16 *)(out_buf + i) ^= 0xFFFF;
+    INSERT16(out_buf, i, EXTRACT16(out_buf, i) ^ 0xFFFF);
 
   }
 
@@ -1042,11 +1061,11 @@ u8 fuzz_one(afl_state_t *afl) {
 
     if (!bitmap_read(skip_eff_map, i)) continue;
 
-    if (is_det_timeout(before_det_time, 0)) { goto custom_mutator_stage; }
+    if (is_det_timeout(afl, 0)) { goto custom_mutator_stage; }
 
     afl->stage_cur_byte = i;
 
-    *(u32 *)(out_buf + i) ^= 0xFFFFFFFF;
+    INSERT32(out_buf, i, EXTRACT32(out_buf, i) ^ 0xFFFFFFFF);
 
 #ifdef INTROSPECTION
     snprintf(afl->mutation, sizeof(afl->mutation), "%s FLIP_BIT32-%u",
@@ -1056,7 +1075,7 @@ u8 fuzz_one(afl_state_t *afl) {
     if (common_fuzz_stuff(afl, out_buf, len)) { goto abandon_entry; }
     ++afl->stage_cur;
 
-    *(u32 *)(out_buf + i) ^= 0xFFFFFFFF;
+    INSERT32(out_buf, i, EXTRACT32(out_buf, i) ^ 0xFFFFFFFF);
 
   }
 
@@ -1095,7 +1114,7 @@ skip_bitflip:
 
     if (!bitmap_read(skip_eff_map, i)) continue;
 
-    if (is_det_timeout(before_det_time, 0)) { goto custom_mutator_stage; }
+    if (is_det_timeout(afl, 0)) { goto custom_mutator_stage; }
 
     afl->stage_cur_byte = i;
 
@@ -1173,13 +1192,13 @@ skip_bitflip:
 
   for (i = 0; i < (u32)len - 1; ++i) {
 
-    u16 orig = *(u16 *)(out_buf + i);
+    u16 orig = EXTRACT16(out_buf, i);
 
     /* Let's consult the effector map... */
 
     if (!bitmap_read(skip_eff_map, i)) continue;
 
-    if (is_det_timeout(before_det_time, 0)) { goto custom_mutator_stage; }
+    if (is_det_timeout(afl, 0)) { goto custom_mutator_stage; }
 
     afl->stage_cur_byte = i;
 
@@ -1199,7 +1218,7 @@ skip_bitflip:
       if ((orig & 0xff) + j > 0xff && !could_be_bitflip(r1)) {
 
         afl->stage_cur_val = j;
-        *(u16 *)(out_buf + i) = orig + j;
+        INSERT16(out_buf, i, orig + j);
 
 #ifdef INTROSPECTION
         snprintf(afl->mutation, sizeof(afl->mutation), "%s ARITH16+-%u-%u",
@@ -1218,7 +1237,7 @@ skip_bitflip:
       if ((orig & 0xff) < j && !could_be_bitflip(r2)) {
 
         afl->stage_cur_val = -j;
-        *(u16 *)(out_buf + i) = orig - j;
+        INSERT16(out_buf, i, orig - j);
 
 #ifdef INTROSPECTION
         snprintf(afl->mutation, sizeof(afl->mutation), "%s ARITH16--%u-%u",
@@ -1241,7 +1260,7 @@ skip_bitflip:
       if ((orig >> 8) + j > 0xff && !could_be_bitflip(r3)) {
 
         afl->stage_cur_val = j;
-        *(u16 *)(out_buf + i) = SWAP16(SWAP16(orig) + j);
+        INSERT16(out_buf, i, SWAP16(SWAP16(orig) + j));
 
 #ifdef INTROSPECTION
         snprintf(afl->mutation, sizeof(afl->mutation), "%s ARITH16+BE-%u-%u",
@@ -1260,7 +1279,7 @@ skip_bitflip:
       if ((orig >> 8) < j && !could_be_bitflip(r4)) {
 
         afl->stage_cur_val = -j;
-        *(u16 *)(out_buf + i) = SWAP16(SWAP16(orig) - j);
+        INSERT16(out_buf, i, SWAP16(SWAP16(orig) - j));
 
 #ifdef INTROSPECTION
         snprintf(afl->mutation, sizeof(afl->mutation), "%s ARITH16_BE-%u-%u",
@@ -1276,7 +1295,7 @@ skip_bitflip:
 
       }
 
-      *(u16 *)(out_buf + i) = orig;
+      INSERT16(out_buf, i, orig);
 
     }
 
@@ -1303,13 +1322,13 @@ skip_bitflip:
 
   for (i = 0; i < (u32)len - 3; ++i) {
 
-    u32 orig = *(u32 *)(out_buf + i);
+    u32 orig = EXTRACT32(out_buf, i);
 
     /* Let's consult the effector map... */
 
     if (!bitmap_read(skip_eff_map, i)) continue;
 
-    if (is_det_timeout(before_det_time, 0)) { goto custom_mutator_stage; }
+    if (is_det_timeout(afl, 0)) { goto custom_mutator_stage; }
 
     afl->stage_cur_byte = i;
 
@@ -1327,7 +1346,7 @@ skip_bitflip:
       if ((orig & 0xffff) + j > 0xffff && !could_be_bitflip(r1)) {
 
         afl->stage_cur_val = j;
-        *(u32 *)(out_buf + i) = orig + j;
+        INSERT32(out_buf, i, orig + j);
 
 #ifdef INTROSPECTION
         snprintf(afl->mutation, sizeof(afl->mutation), "%s ARITH32+-%u-%u",
@@ -1346,7 +1365,7 @@ skip_bitflip:
       if ((orig & 0xffff) < (u32)j && !could_be_bitflip(r2)) {
 
         afl->stage_cur_val = -j;
-        *(u32 *)(out_buf + i) = orig - j;
+        INSERT32(out_buf, i, orig - j);
 
 #ifdef INTROSPECTION
         snprintf(afl->mutation, sizeof(afl->mutation), "%s ARITH32_-%u-%u",
@@ -1369,7 +1388,7 @@ skip_bitflip:
       if ((SWAP32(orig) & 0xffff) + j > 0xffff && !could_be_bitflip(r3)) {
 
         afl->stage_cur_val = j;
-        *(u32 *)(out_buf + i) = SWAP32(SWAP32(orig) + j);
+        INSERT32(out_buf, i, SWAP32(SWAP32(orig) + j));
 
 #ifdef INTROSPECTION
         snprintf(afl->mutation, sizeof(afl->mutation), "%s ARITH32+BE-%u-%u",
@@ -1388,7 +1407,7 @@ skip_bitflip:
       if ((SWAP32(orig) & 0xffff) < (u32)j && !could_be_bitflip(r4)) {
 
         afl->stage_cur_val = -j;
-        *(u32 *)(out_buf + i) = SWAP32(SWAP32(orig) - j);
+        INSERT32(out_buf, i, SWAP32(SWAP32(orig) - j));
 
 #ifdef INTROSPECTION
         snprintf(afl->mutation, sizeof(afl->mutation), "%s ARITH32_BE-%u-%u",
@@ -1404,7 +1423,7 @@ skip_bitflip:
 
       }
 
-      *(u32 *)(out_buf + i) = orig;
+      INSERT32(out_buf, i, orig);
 
     }
 
@@ -1443,7 +1462,7 @@ skip_arith:
 
     if (!bitmap_read(skip_eff_map, i)) continue;
 
-    if (is_det_timeout(before_det_time, 0)) { goto custom_mutator_stage; }
+    if (is_det_timeout(afl, 0)) { goto custom_mutator_stage; }
 
     afl->stage_cur_byte = i;
 
@@ -1497,13 +1516,13 @@ skip_arith:
 
   for (i = 0; i < len - 1; ++i) {
 
-    u16 orig = *(u16 *)(out_buf + i);
+    u16 orig = EXTRACT16(out_buf, i);
 
     /* Let's consult the effector map... */
 
     if (!bitmap_read(skip_eff_map, i)) continue;
 
-    if (is_det_timeout(before_det_time, 0)) { goto custom_mutator_stage; }
+    if (is_det_timeout(afl, 0)) { goto custom_mutator_stage; }
 
     afl->stage_cur_byte = i;
 
@@ -1520,7 +1539,7 @@ skip_arith:
 
         afl->stage_val_type = STAGE_VAL_LE;
 
-        *(u16 *)(out_buf + i) = interesting_16[j];
+        INSERT16(out_buf, i, interesting_16[j]);
 
 #ifdef INTROSPECTION
         snprintf(afl->mutation, sizeof(afl->mutation), "%s INTERESTING16_%u_%u",
@@ -1548,7 +1567,7 @@ skip_arith:
                  "%s INTERESTING16BE_%u_%u", afl->queue_cur->fname, i, j);
 #endif
 
-        *(u16 *)(out_buf + i) = SWAP16(interesting_16[j]);
+        INSERT16(out_buf, i, SWAP16(interesting_16[j]));
         if (common_fuzz_stuff(afl, out_buf, len)) { goto abandon_entry; }
         ++afl->stage_cur;
 
@@ -1560,7 +1579,7 @@ skip_arith:
 
     }
 
-    *(u16 *)(out_buf + i) = orig;
+    INSERT16(out_buf, i, orig);
 
   }
 
@@ -1585,13 +1604,13 @@ skip_arith:
 
   for (i = 0; i < len - 3; i++) {
 
-    u32 orig = *(u32 *)(out_buf + i);
+    u32 orig = EXTRACT32(out_buf, i);
 
     /* Let's consult the effector map... */
 
     if (!bitmap_read(skip_eff_map, i)) continue;
 
-    if (is_det_timeout(before_det_time, 0)) { goto custom_mutator_stage; }
+    if (is_det_timeout(afl, 0)) { goto custom_mutator_stage; }
 
     afl->stage_cur_byte = i;
 
@@ -1608,7 +1627,7 @@ skip_arith:
 
         afl->stage_val_type = STAGE_VAL_LE;
 
-        *(u32 *)(out_buf + i) = interesting_32[j];
+        INSERT32(out_buf, i, interesting_32[j]);
 
 #ifdef INTROSPECTION
         snprintf(afl->mutation, sizeof(afl->mutation), "%s INTERESTING32_%u_%u",
@@ -1636,7 +1655,7 @@ skip_arith:
                  "%s INTERESTING32BE_%u_%u", afl->queue_cur->fname, i, j);
 #endif
 
-        *(u32 *)(out_buf + i) = SWAP32(interesting_32[j]);
+        INSERT32(out_buf, i, SWAP32(interesting_32[j]));
         if (common_fuzz_stuff(afl, out_buf, len)) { goto abandon_entry; }
         ++afl->stage_cur;
 
@@ -1648,7 +1667,7 @@ skip_arith:
 
     }
 
-    *(u32 *)(out_buf + i) = orig;
+    INSERT32(out_buf, i, orig);
 
   }
 
@@ -1685,7 +1704,7 @@ skip_interest:
 
     if (!bitmap_read(skip_eff_map, i)) continue;
 
-    if (is_det_timeout(before_det_time, 0)) { goto custom_mutator_stage; }
+    if (is_det_timeout(afl, 0)) { goto custom_mutator_stage; }
 
     afl->stage_cur_byte = i;
 
@@ -1754,7 +1773,7 @@ skip_interest:
 
     if (!bitmap_read(skip_eff_map, i % len)) continue;
 
-    if (is_det_timeout(before_det_time, 0)) { goto custom_mutator_stage; }
+    if (is_det_timeout(afl, 0)) { goto custom_mutator_stage; }
 
     afl->stage_cur_byte = i;
 
@@ -1820,7 +1839,7 @@ skip_user_extras:
 
     if (!bitmap_read(skip_eff_map, i)) continue;
 
-    if (is_det_timeout(before_det_time, 0)) { goto custom_mutator_stage; }
+    if (is_det_timeout(afl, 0)) { goto custom_mutator_stage; }
 
     afl->stage_cur_byte = i;
 
@@ -1880,7 +1899,7 @@ skip_user_extras:
 
     if (!bitmap_read(skip_eff_map, i % len)) continue;
 
-    if (is_det_timeout(before_det_time, 0)) { goto custom_mutator_stage; }
+    if (is_det_timeout(afl, 0)) { goto custom_mutator_stage; }
 
     afl->stage_cur_byte = i;
 
@@ -2197,6 +2216,8 @@ havoc_stage:
   u32 *mutation_array;
   u32  stack_max, rand_max;  // stack_max_pow = afl->havoc_stack_pow2;
 
+  if (unlikely(afl->starved)) { afl->input_mode = (rand_next(afl) % 3); }
+
   switch (afl->input_mode) {
 
     case 1: {  // TEXT
@@ -2308,6 +2329,7 @@ havoc_stage:
   u64 mopt_stage_start_us = get_cur_time_us();
   u64 mopt_stage_start_finds = afl->queued_items + afl->saved_crashes;
   u64 mopt_stage_start_execs = afl->fsrv.total_execs;
+  u64 havoc_finds = mopt_stage_start_finds;
 
   for (afl->stage_cur = 0; afl->stage_cur < afl->stage_max; ++afl->stage_cur) {
 
@@ -2369,8 +2391,7 @@ havoc_stage:
 
       u32 r = rand_below(afl, rand_max), item;
       u32 mopt_op = mutation_array[r];
-
-      mopt_record_use(afl, mopt_op);
+      u8  mopt_changed = 0;
 
       switch (mopt_op) {
 
@@ -2380,6 +2401,7 @@ havoc_stage:
           u8  bit = rand_below(afl, 8);
           u32 off = rand_below(afl, temp_len);
           out_buf[off] ^= 1 << bit;
+          mopt_changed = 1;
 
 #ifdef INTROSPECTION
           snprintf(afl->m_tmp, sizeof(afl->m_tmp), " FLIP-BIT_%u", bit);
@@ -2398,7 +2420,9 @@ havoc_stage:
           snprintf(afl->m_tmp, sizeof(afl->m_tmp), " INTERESTING8_%u", item);
           strcat(afl->mutation, afl->m_tmp);
 #endif
-          out_buf[rand_below(afl, temp_len)] = interesting_8[item];
+          u32 pos = rand_below(afl, temp_len);
+          mopt_changed = out_buf[pos] != (u8)interesting_8[item];
+          out_buf[pos] = interesting_8[item];
           break;
 
         }
@@ -2415,8 +2439,10 @@ havoc_stage:
           strcat(afl->mutation, afl->m_tmp);
 #endif
 
-          *(u16 *)(out_buf + rand_below(afl, temp_len - 1)) =
-              interesting_16[item];
+          u32 pos = rand_below(afl, temp_len - 1);
+          u16 val = interesting_16[item];
+          mopt_changed = memcmp(out_buf + pos, &val, sizeof(val)) != 0;
+          INSERT16(out_buf, pos, val);
 
           break;
 
@@ -2433,8 +2459,10 @@ havoc_stage:
           snprintf(afl->m_tmp, sizeof(afl->m_tmp), " INTERESTING16BE_%u", item);
           strcat(afl->mutation, afl->m_tmp);
 #endif
-          *(u16 *)(out_buf + rand_below(afl, temp_len - 1)) =
-              SWAP16(interesting_16[item]);
+          u32 pos = rand_below(afl, temp_len - 1);
+          u16 val = SWAP16(interesting_16[item]);
+          mopt_changed = memcmp(out_buf + pos, &val, sizeof(val)) != 0;
+          INSERT16(out_buf, pos, val);
 
           break;
 
@@ -2452,8 +2480,10 @@ havoc_stage:
           strcat(afl->mutation, afl->m_tmp);
 #endif
 
-          *(u32 *)(out_buf + rand_below(afl, temp_len - 3)) =
-              interesting_32[item];
+          u32 pos = rand_below(afl, temp_len - 3);
+          u32 val = interesting_32[item];
+          mopt_changed = memcmp(out_buf + pos, &val, sizeof(val)) != 0;
+          INSERT32(out_buf, pos, val);
 
           break;
 
@@ -2470,8 +2500,10 @@ havoc_stage:
           snprintf(afl->m_tmp, sizeof(afl->m_tmp), " INTERESTING32BE_%u", item);
           strcat(afl->mutation, afl->m_tmp);
 #endif
-          *(u32 *)(out_buf + rand_below(afl, temp_len - 3)) =
-              SWAP32(interesting_32[item]);
+          u32 pos = rand_below(afl, temp_len - 3);
+          u32 val = SWAP32(interesting_32[item]);
+          mopt_changed = memcmp(out_buf + pos, &val, sizeof(val)) != 0;
+          INSERT32(out_buf, pos, val);
 
           break;
 
@@ -2487,6 +2519,7 @@ havoc_stage:
           strcat(afl->mutation, afl->m_tmp);
 #endif
           out_buf[rand_below(afl, temp_len)] -= item;
+          mopt_changed = 1;
           break;
 
         }
@@ -2501,6 +2534,7 @@ havoc_stage:
           strcat(afl->mutation, afl->m_tmp);
 #endif
           out_buf[rand_below(afl, temp_len)] += item;
+          mopt_changed = 1;
           break;
 
         }
@@ -2518,7 +2552,8 @@ havoc_stage:
           snprintf(afl->m_tmp, sizeof(afl->m_tmp), " ARITH16-_%u", item);
           strcat(afl->mutation, afl->m_tmp);
 #endif
-          *(u16 *)(out_buf + pos) -= item;
+          INSERT16(out_buf, pos, EXTRACT16(out_buf, pos) - item);
+          mopt_changed = 1;
 
           break;
 
@@ -2537,8 +2572,8 @@ havoc_stage:
           snprintf(afl->m_tmp, sizeof(afl->m_tmp), " ARITH16BE-_%u", num);
           strcat(afl->mutation, afl->m_tmp);
 #endif
-          *(u16 *)(out_buf + pos) =
-              SWAP16(SWAP16(*(u16 *)(out_buf + pos)) - num);
+          INSERT16(out_buf, pos, SWAP16(SWAP16(EXTRACT16(out_buf, pos)) - num));
+          mopt_changed = 1;
 
           break;
 
@@ -2557,7 +2592,8 @@ havoc_stage:
           snprintf(afl->m_tmp, sizeof(afl->m_tmp), " ARITH16+_%u", item);
           strcat(afl->mutation, afl->m_tmp);
 #endif
-          *(u16 *)(out_buf + pos) += item;
+          INSERT16(out_buf, pos, EXTRACT16(out_buf, pos) + item);
+          mopt_changed = 1;
 
           break;
 
@@ -2576,8 +2612,8 @@ havoc_stage:
           snprintf(afl->m_tmp, sizeof(afl->m_tmp), " ARITH16BE+__%u", num);
           strcat(afl->mutation, afl->m_tmp);
 #endif
-          *(u16 *)(out_buf + pos) =
-              SWAP16(SWAP16(*(u16 *)(out_buf + pos)) + num);
+          INSERT16(out_buf, pos, SWAP16(SWAP16(EXTRACT16(out_buf, pos)) + num));
+          mopt_changed = 1;
 
           break;
 
@@ -2596,7 +2632,8 @@ havoc_stage:
           snprintf(afl->m_tmp, sizeof(afl->m_tmp), " ARITH32-_%u", item);
           strcat(afl->mutation, afl->m_tmp);
 #endif
-          *(u32 *)(out_buf + pos) -= item;
+          INSERT32(out_buf, pos, EXTRACT32(out_buf, pos) - item);
+          mopt_changed = 1;
 
           break;
 
@@ -2615,8 +2652,8 @@ havoc_stage:
           snprintf(afl->m_tmp, sizeof(afl->m_tmp), " ARITH32BE-_%u", num);
           strcat(afl->mutation, afl->m_tmp);
 #endif
-          *(u32 *)(out_buf + pos) =
-              SWAP32(SWAP32(*(u32 *)(out_buf + pos)) - num);
+          INSERT32(out_buf, pos, SWAP32(SWAP32(EXTRACT32(out_buf, pos)) - num));
+          mopt_changed = 1;
 
           break;
 
@@ -2635,7 +2672,8 @@ havoc_stage:
           snprintf(afl->m_tmp, sizeof(afl->m_tmp), " ARITH32+_%u", item);
           strcat(afl->mutation, afl->m_tmp);
 #endif
-          *(u32 *)(out_buf + pos) += item;
+          INSERT32(out_buf, pos, EXTRACT32(out_buf, pos) + item);
+          mopt_changed = 1;
 
           break;
 
@@ -2654,8 +2692,8 @@ havoc_stage:
           snprintf(afl->m_tmp, sizeof(afl->m_tmp), " ARITH32BE+_%u", num);
           strcat(afl->mutation, afl->m_tmp);
 #endif
-          *(u32 *)(out_buf + pos) =
-              SWAP32(SWAP32(*(u32 *)(out_buf + pos)) + num);
+          INSERT32(out_buf, pos, SWAP32(SWAP32(EXTRACT32(out_buf, pos)) + num));
+          mopt_changed = 1;
 
           break;
 
@@ -2675,17 +2713,20 @@ havoc_stage:
           strcat(afl->mutation, afl->m_tmp);
 #endif
           out_buf[pos] ^= item;
+          mopt_changed = 1;
           break;
 
         }
 
         case MUT_CLONE_COPY: {
 
-          if (likely(temp_len + HAVOC_BLK_XL < MAX_FILE)) {
+          if (likely(temp_len + 1 < MAX_FILE)) {
 
             /* Clone bytes. */
 
             u32 clone_len = choose_block_len(afl, temp_len);
+            u32 clone_cap = (u32)(MAX_FILE - 1 - temp_len);
+            if (unlikely(clone_len > clone_cap)) { clone_len = clone_cap; }
             u32 clone_from = rand_below(afl, temp_len - clone_len + 1);
             u32 clone_to = rand_below(afl, temp_len);
 
@@ -2713,6 +2754,7 @@ havoc_stage:
             out_buf = new_buf;
             afl_swap_bufs(AFL_BUF_PARAM(out), AFL_BUF_PARAM(out_scratch));
             temp_len += clone_len;
+            mopt_changed = 1;
 
             // Frameshift tracking
             if (likely(!afl->afl_env.afl_frameshift_disabled)) {
@@ -2741,11 +2783,13 @@ havoc_stage:
 
         case MUT_CLONE_FIXED: {
 
-          if (likely(temp_len + HAVOC_BLK_XL < MAX_FILE)) {
+          if (likely(temp_len + 1 < MAX_FILE)) {
 
             /* Insert a block of constant bytes (25%). */
 
             u32 clone_len = choose_block_len(afl, HAVOC_BLK_XL);
+            u32 clone_cap = (u32)(MAX_FILE - 1 - temp_len);
+            if (unlikely(clone_len > clone_cap)) { clone_len = clone_cap; }
             u32 clone_to = rand_below(afl, temp_len);
             u32 strat = rand_below(afl, 2);
             u32 clone_from = clone_to ? clone_to - 1 : 0;
@@ -2775,6 +2819,7 @@ havoc_stage:
             out_buf = new_buf;
             afl_swap_bufs(AFL_BUF_PARAM(out), AFL_BUF_PARAM(out_scratch));
             temp_len += clone_len;
+            mopt_changed = 1;
 
             // Frameshift tracking
             if (likely(!afl->afl_env.afl_frameshift_disabled)) {
@@ -2822,6 +2867,8 @@ havoc_stage:
                    copy_from, copy_to, copy_len);
           strcat(afl->mutation, afl->m_tmp);
 #endif
+          mopt_changed =
+              memcmp(out_buf + copy_to, out_buf + copy_from, copy_len) != 0;
           memmove(out_buf + copy_to, out_buf + copy_from, copy_len);
 
           break;
@@ -2846,6 +2893,12 @@ havoc_stage:
                    copy_len);
           strcat(afl->mutation, afl->m_tmp);
 #endif
+          for (u32 pos = 0; pos < copy_len && !mopt_changed; ++pos) {
+
+            mopt_changed = out_buf[copy_to + pos] != (u8)item;
+
+          }
+
           memset(out_buf + copy_to, item, copy_len);
 
           break;
@@ -2861,6 +2914,7 @@ havoc_stage:
           strcat(afl->mutation, afl->m_tmp);
 #endif
           out_buf[rand_below(afl, temp_len)]++;
+          mopt_changed = 1;
           break;
 
         }
@@ -2874,6 +2928,7 @@ havoc_stage:
           strcat(afl->mutation, afl->m_tmp);
 #endif
           out_buf[rand_below(afl, temp_len)]--;
+          mopt_changed = 1;
           break;
 
         }
@@ -2887,6 +2942,7 @@ havoc_stage:
           strcat(afl->mutation, afl->m_tmp);
 #endif
           out_buf[rand_below(afl, temp_len)] ^= 0xff;
+          mopt_changed = 1;
           break;
 
         }
@@ -2928,6 +2984,9 @@ havoc_stage:
           strcat(afl->mutation, afl->m_tmp);
 #endif
 
+          mopt_changed = memcmp(out_buf + switch_from, out_buf + switch_to,
+                                switch_len) != 0;
+
           /* Backup */
 
           memcpy(new_buf, out_buf + switch_from, switch_len);
@@ -2964,6 +3023,7 @@ havoc_stage:
                   temp_len - del_from - del_len);
 
           temp_len -= del_len;
+          mopt_changed = 1;
 
           // Frameshift tracking
           if (likely(!afl->afl_env.afl_frameshift_disabled)) {
@@ -2988,6 +3048,9 @@ havoc_stage:
 
           u32 len = choose_block_len(afl, temp_len - 1);
           u32 off = rand_below(afl, temp_len - len + 1);
+          u8 *new_buf = afl_realloc(AFL_BUF_PARAM(out_scratch), len);
+          if (unlikely(!new_buf)) { PFATAL("alloc"); }
+          memcpy(new_buf, out_buf + off, len);
 
 #ifdef INTROSPECTION
           snprintf(afl->m_tmp, sizeof(afl->m_tmp), " SHUFFLE_%u", len);
@@ -3008,6 +3071,8 @@ havoc_stage:
             out_buf[off + j] = temp;
 
           }
+
+          mopt_changed = memcmp(new_buf, out_buf + off, len) != 0;
 
           break;
 
@@ -3032,6 +3097,7 @@ havoc_stage:
                   temp_len - del_from - del_len);
 
           temp_len -= del_len;
+          mopt_changed = 1;
 
           // Frameshift tracking
           if (likely(!afl->afl_env.afl_frameshift_disabled)) {
@@ -3082,6 +3148,7 @@ havoc_stage:
           out_buf = new_buf;
           afl_swap_bufs(AFL_BUF_PARAM(out), AFL_BUF_PARAM(out_scratch));
           temp_len += clone_len;
+          mopt_changed = 1;
 
           // Frameshift tracking
           if (likely(!afl->afl_env.afl_frameshift_disabled)) {
@@ -3150,7 +3217,18 @@ havoc_stage:
           s64 val = out_buf[off] - '0';
           for (u32 i = off + 1; i < off2; ++i) {
 
-            val = (val * 10) + out_buf[i] - '0';
+            u8  digit = out_buf[i] - '0';
+            s64 valx10;
+
+            if (val > INT64_MAX / 10 ||
+                (valx10 = (val * 10)) > INT64_MAX - digit) {
+
+              off2 = i;
+              break;
+
+            }
+
+            val = valx10 + digit;
 
           }
 
@@ -3160,12 +3238,33 @@ havoc_stage:
           switch (strat) {
 
             case 0:
+              if (val == INT64_MAX) {
+
+                val /= 10;
+                --off2;
+
+              }
+
               val++;
               break;
             case 1:
+              if (val == INT64_MIN) {
+
+                val /= 10;
+                --off2;
+
+              }
+
               val--;
               break;
             case 2:
+              if (val > INT64_MAX / 2 || val < INT64_MIN / 2) {
+
+                val /= 10;
+                --off2;
+
+              }
+
               val *= 2;
               break;
             case 3:
@@ -3184,9 +3283,23 @@ havoc_stage:
 
               break;
             case 5:
+              if (val > INT64_MAX - 256) {
+
+                val /= 10;
+                --off2;
+
+              }
+
               val += rand_below(afl, 256);
               break;
             case 6:
+              if (val < INT64_MIN + 256) {
+
+                val /= 10;
+                --off2;
+
+              }
+
               val -= rand_below(afl, 256);
               break;
             case 7:
@@ -3202,7 +3315,7 @@ havoc_stage:
 #endif
           // fprintf(stderr, "val: %u-%u = %ld\n", off, off2, val);
 
-          char buf[20];
+          char buf[32];
           snprintf(buf, sizeof(buf), "%" PRId64, val);
 
           // fprintf(stderr, "BEFORE: %s\n", out_buf);
@@ -3212,9 +3325,12 @@ havoc_stage:
 
           if (old_len == new_len) {
 
+            mopt_changed = memcmp(out_buf + off, buf, new_len) != 0;
             memcpy(out_buf + off, buf, new_len);
 
           } else {
+
+            mopt_changed = 1;
 
             u8 *new_buf = afl_realloc(AFL_BUF_PARAM(out_scratch),
                                       temp_len + new_len - old_len);
@@ -3278,9 +3394,22 @@ havoc_stage:
           strcat(afl->mutation, afl->m_tmp);
 #endif
           u64  val = rand_next(afl);
-          char buf[20];
+          char buf[32];
           snprintf(buf, sizeof(buf), "%llu", val);
-          memcpy(out_buf + pos, buf, len);
+          u32 val_len = strlen(buf), digit_off;
+          if (len > val_len) {
+
+            len = val_len;
+            digit_off = 0;
+
+          } else {
+
+            digit_off = val_len - len;
+
+          }
+
+          mopt_changed = memcmp(out_buf + pos, buf + digit_off, len) != 0;
+          memcpy(out_buf + pos, buf + digit_off, len);
 
           break;
 
@@ -3303,6 +3432,8 @@ havoc_stage:
                    insert_at, extra_len);
           strcat(afl->mutation, afl->m_tmp);
 #endif
+          mopt_changed = memcmp(out_buf + insert_at,
+                                afl->extras[use_extra].data, extra_len) != 0;
           memcpy(out_buf + insert_at, afl->extras[use_extra].data, extra_len);
 
           break;
@@ -3339,6 +3470,7 @@ havoc_stage:
           /* Inserted part */
           memcpy(out_buf + insert_at, ptr, extra_len);
           temp_len += extra_len;
+          mopt_changed = extra_len != 0;
 
           // Frameshift tracking
           if (likely(!afl->afl_env.afl_frameshift_disabled)) {
@@ -3372,6 +3504,8 @@ havoc_stage:
                    " AUTO-EXTRA-OVERWRITE_%u_%u", insert_at, extra_len);
           strcat(afl->mutation, afl->m_tmp);
 #endif
+          mopt_changed = memcmp(out_buf + insert_at,
+                                afl->a_extras[use_extra].data, extra_len) != 0;
           memcpy(out_buf + insert_at, afl->a_extras[use_extra].data, extra_len);
 
           break;
@@ -3408,6 +3542,7 @@ havoc_stage:
           /* Inserted part */
           memcpy(out_buf + insert_at, ptr, extra_len);
           temp_len += extra_len;
+          mopt_changed = extra_len != 0;
 
           // Frameshift tracking
           if (likely(!afl->afl_env.afl_frameshift_disabled)) {
@@ -3479,6 +3614,8 @@ havoc_stage:
                    copy_len, target->fname);
           strcat(afl->mutation, afl->m_tmp);
 #endif
+          mopt_changed =
+              memcmp(out_buf + copy_to, new_buf + copy_from, copy_len) != 0;
           memmove(out_buf + copy_to, new_buf + copy_from, copy_len);
 
           break;
@@ -3493,11 +3630,7 @@ havoc_stage:
 
           }
 
-          if (unlikely(temp_len + HAVOC_BLK_XL >= MAX_FILE)) {
-
-            goto retry_havoc_step;
-
-          }
+          if (unlikely(temp_len + 1 >= MAX_FILE)) { goto retry_havoc_step; }
 
           /* Pick a random queue entry and seek to it. */
 
@@ -3535,6 +3668,8 @@ havoc_stage:
           u32 clone_from, clone_to, clone_len;
 
           clone_len = choose_block_len(afl, new_len);
+          u32 clone_cap = (u32)(MAX_FILE - 1 - temp_len);
+          if (unlikely(clone_len > clone_cap)) { clone_len = clone_cap; }
           clone_from = rand_below(afl, new_len - clone_len + 1);
           clone_to = rand_below(afl, temp_len + 1);
 
@@ -3562,6 +3697,7 @@ havoc_stage:
           out_buf = temp_buf;
           afl_swap_bufs(AFL_BUF_PARAM(out), AFL_BUF_PARAM(out_scratch));
           temp_len += clone_len;
+          mopt_changed = clone_len != 0;
 
           // Frameshift tracking
           if (likely(!afl->afl_env.afl_frameshift_disabled)) {
@@ -3580,13 +3716,25 @@ havoc_stage:
 
       }
 
-    }
+      if (likely(mopt_changed)) { mopt_record_use(afl, mopt_op); }
 
     }
 
-    if (common_fuzz_stuff(afl, out_buf, temp_len)) { goto abandon_entry; }
+    }
 
-    mopt_commit_round(afl, (u8)(afl->queued_items != havoc_queued));
+    if (likely((temp_len != len) || memcmp(out_buf, in_buf, len))) {
+
+      if (common_fuzz_stuff(afl, out_buf, temp_len)) { goto abandon_entry; }
+
+      u64 cur_finds = afl->queued_items + afl->saved_crashes;
+      mopt_commit_round(afl, (u8)(cur_finds != havoc_finds));
+      havoc_finds = cur_finds;
+
+    } else {
+
+      mopt_round_reset(afl);
+
+    }
 
     /* out_buf might have been mangled a bit, so let's restore it to its
        original size and shape. */
@@ -3805,11 +3953,20 @@ abandon_entry:
 
     if (likely(afl->pending_not_fuzzed)) { --afl->pending_not_fuzzed; }
     afl->queue_cur->was_fuzzed = 1;
-    afl->reinit_table = 1;
+
     if (afl->queue_cur->favored) {
 
       if (likely(afl->pending_favored)) { --afl->pending_favored; }
       afl->smallest_favored = -1;
+      afl->reinit_table = 1;
+
+    } else {
+
+      if (unlikely(++afl->pending_reinit > (afl->active_items >> 3))) {
+
+        afl->reinit_table = 1;
+
+      }
 
     }
 

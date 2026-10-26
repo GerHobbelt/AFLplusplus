@@ -71,8 +71,8 @@
   #define ck_gzwrite(fd, buf, len, fn)                                    \
     do {                                                                  \
                                                                           \
-      if (len <= 0) break;                                                \
       s32 _written = 0, _off = 0, _len = (s32)(len);                      \
+      if (_len <= 0) break;                                               \
                                                                           \
       do {                                                                \
                                                                           \
@@ -423,7 +423,6 @@ static void usage(u8 *argv0, int more_help) {
       "AFL_CRASH_TRACES: write output and core to the crash file information - slow!\n"
       "AFL_CUSTOM_MUTATOR_LIBRARY: lib with afl_custom_fuzz() to mutate inputs\n"
       "AFL_CUSTOM_MUTATOR_ONLY: avoid AFL++'s internal mutators\n"
-      "AFL_CYCLE_SCHEDULES: after completing a cycle, switch to a different -p schedule\n"
       "AFL_DEBUG: extra debugging output for Python mode trimming\n"
       "AFL_DEBUG_CHILD: do not suppress stdout/stderr from target\n"
       "AFL_DISABLE_REDUNDANT: disable any queue item that is redundant\n"
@@ -697,8 +696,7 @@ afl_state_t *afl_init(void) {
 
 void afl_parse_env(afl_state_t *afl, char **envp) {
 
-  struct timeval  tv;
-  struct timezone tz;
+  struct timespec ts;
 
   read_afl_environment(afl, envp);
   if (afl->shm.map_size) { afl->fsrv.map_size = afl->shm.map_size; }
@@ -754,8 +752,8 @@ void afl_parse_env(afl_state_t *afl, char **envp) {
        "available to companies that do not want to use the AGPL, see "
        "LICENSE.COMMERCIAL.\n" cRST);
 
-  gettimeofday(&tv, &tz);
-  rand_set_seed(afl, tv.tv_sec ^ tv.tv_usec ^ getpid());
+  clock_gettime(CLOCK_REALTIME, &ts);
+  rand_set_seed(afl, ts.tv_sec ^ ts.tv_nsec ^ getpid());
 
   afl->shmem_testcase_mode = 1;  // we always try to perform shmem fuzzing
 
@@ -1638,6 +1636,11 @@ void afl_parse_commandline(afl_state_t *afl, int argc, char **argv) {
 
   }
 
+  afl->saved_schedule = afl->schedule;
+  afl->saved_input_mode = afl->input_mode;
+  afl->saved_use_splicing = afl->use_splicing;
+  afl->saved_cmplog_enable_arith = afl->cmplog_enable_arith;
+
   if (optind == argc || !afl->in_dir || !afl->out_dir || show_help) {
 
     usage(argv[0], show_help);
@@ -1896,12 +1899,6 @@ void afl_check_environment(afl_state_t *afl) {
   if (afl->schedule >= FAST && afl->schedule <= RARE) {
 
     afl->n_fuzz = ck_alloc(N_FUZZ_SIZE * sizeof(u32));
-
-  }
-
-  if (afl->cycle_schedules) {
-
-    afl->top_rated_candidates = ck_alloc(afl->map_size * sizeof(u32 *));
 
   }
 
@@ -3736,7 +3733,6 @@ void stop_fuzzing(afl_state_t *afl) {
   ck_free(afl->n_fuzz);
   ck_free(afl->n_fuzz_dup);
   ck_free(afl->simplified_n_fuzz);
-  ck_free(afl->min_slack);
   if (afl->frameshift_index_buffer) { free(afl->frameshift_index_buffer); }
   if (afl->fs_curr_meta) {
 

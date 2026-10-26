@@ -51,8 +51,14 @@
 /* Default time until when no more coverage finds are happening afl-fuzz
    switches to exploitation mode. It automatically switches back when new
    coverage is found.
-   Default: 300 (seconds) */
+   Default: 1000 (seconds) */
 #define STRATEGY_SWITCH_TIME 1000
+#define STARVE_EDGE_EXECS (5000000ULL)
+#define SWITCH_EXECS (6000000ULL)
+#define CMPLOG_I2S_EXECS (2000000ULL)
+#define SKIPDET_DECAY_EXECS (10000000ULL)
+#define MAX_EFF_EXECS (5000000ULL)
+#define MAX_DET_EXECS (8000000ULL)
 
 /* Default file permission umode when creating directories */
 #define DEFAULT_DIRS_PERMISSION 0700
@@ -75,14 +81,7 @@
 /* SkipDet's global configuration */
 
 #define MINIMAL_BLOCK_SIZE 64
-#define SMALL_DET_TIME (60 * 1000 * 1000U)
-#define MAXIMUM_INF_EXECS (16 * 1024U)
 #define MAXIMUM_QUICK_EFF_EXECS (64 * 1024U)
-#define THRESHOLD_DEC_TIME (20 * 60 * 1000U)
-
-/* Set the Prob of selecting eff_bytes 3 times more than original,
-   Now disabled */
-#define EFF_HAVOC_RATE 3
 
 /* CMPLOG/REDQUEEN TUNING
  *
@@ -317,21 +316,6 @@
 #define USE_AUTO_EXTRAS 4096
 #define MAX_AUTO_EXTRAS (USE_AUTO_EXTRAS * 8)
 
-/* Scaling factor for the effector map used to skip some of the more
-   expensive deterministic steps. The actual divisor is set to
-   2^EFF_MAP_SCALE2 bytes: */
-
-#define EFF_MAP_SCALE2 3
-
-/* Minimum input file length at which the effector logic kicks in: */
-
-#define EFF_MIN_LEN 128
-
-/* Maximum effector density past which everything is just fuzzed
-   unconditionally (%): */
-
-#define EFF_MAX_PERC 90
-
 /* UI refresh frequency (Hz): */
 
 #define UI_TARGET_HZ 5
@@ -447,8 +431,6 @@ We add 4 byte for one u32 length field. */
 
 /* Other less interesting, internal-only variables. */
 
-#define CLANG_ENV_VAR "__AFL_CLANG_MODE"
-#define AS_LOOP_ENV_VAR "__AFL_AS_LOOPCHECK"
 #define PERSIST_ENV_VAR "__AFL_PERSISTENT"
 #define DEFER_ENV_VAR "__AFL_DEFER_FORKSRV"
 
@@ -599,18 +581,6 @@ We add 4 byte for one u32 length field. */
    as "is_ascii"? */
 
 #define AFL_TXT_MIN_PERCENT 99
-
-/* How often to perform ASCII mutations 0 = disable, 1-8 are good values */
-
-#define AFL_TXT_BIAS 6
-
-/* Maximum length of a string to tamper with */
-
-#define AFL_TXT_STRING_MAX_LEN 1024
-
-/* Maximum mutations on a string */
-
-#define AFL_TXT_STRING_MAX_MUTATIONS 6
 
 #endif                                                  /* ! _HAVE_CONFIG_H */
 
