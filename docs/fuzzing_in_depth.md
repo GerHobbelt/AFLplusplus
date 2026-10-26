@@ -637,6 +637,10 @@ during fuzzing) and their number, a value between 50-500MB is recommended. You
 can set the cache size (in MB) by setting the environment variable
 `AFL_TESTCACHE_SIZE`.
 
+The cache keeps the test cases with the highest selection probability per byte,
+recomputed whenever the queue changes, so raising the size keeps improving the
+hit rate instead of filling up with arbitrary entries.
+
 There should be one main fuzzer (`-M main-$HOSTNAME` option - set also
 `AFL_FINAL_SYNC=1`) and as many secondary fuzzers (e.g., `-S variant1`) as you
 have cores that you use. Every `-M`/`-S` entry needs a unique name (that can be
@@ -736,6 +740,13 @@ You can run this manually, per cron job - as you need it. There is a more
 complex and configurable script in
 [utils/distributed_fuzzing](../utils/distributed_fuzzing).
 
+An instance only picks up such freshly copied test cases with its next
+scheduled sync, which can be up to `AFL_SYNC_TIME` (20 minutes by default)
+away. To make it sync immediately, send it a `SIGUSR2`, e.g.
+`killall -USR2 afl-fuzz`. The sync - of the `-M`/`-S` sync directory as well as
+of all `-F` foreign directories - is performed as soon as the queue entry that
+is currently being fuzzed is done, so it does not throw away any work.
+
 ### e) The status of the fuzz campaign
 
 AFL++ comes with the `afl-whatsup` script to show the status of the fuzzing
@@ -751,7 +762,8 @@ execute this script per server.
 
 For a deeper analysis than the `afl-whatsup` summary, use `afl-health`. Instead
 of just listing the numbers it diagnoses the campaign and emits a verdict
-(`healthy`, `degraded`, `stalled`, `misconfigured`, or `dead`), a within-run and
+(`healthy`, `degraded`, `stalled`, `misconfigured`, `dead`, or - if no
+`fuzzer_stats` was found at all - `no_instances`), a within-run and
 cross-run trend, and a ranked list of concrete, actionable recommendations (e.g.
 triage crashes, inject seeds, add a CMPLOG instance, investigate low stability).
 It is read-only - it never modifies the campaign it inspects - and understands

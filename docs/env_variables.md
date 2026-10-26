@@ -338,8 +338,10 @@ For afl-gcc-fast, set `AFL_GCC_CMPLOG=1` instead.
 
 Value-profile compare-observer builds run a small mem2reg promotion before
 compare hook insertion so `-O0` builds expose canonical loop counters to
-loop-control filtering. Set `AFL_LLVM_NO_COMPARE_MEM2REG=1` to disable this
-promotion.
+loop-control filtering. Above `-O0` the promotion skips `optnone` functions; at
+`-O0` it does not, because Clang marks every function `optnone` there and
+skipping them would disable the promotion entirely. Set
+`AFL_LLVM_NO_COMPARE_MEM2REG=1` to disable this promotion.
 
 For more information, see
 [instrumentation/README.cmplog.md](../instrumentation/README.cmplog.md).
@@ -483,6 +485,63 @@ for details.
     If the target performs only a few loops, then this will give a small
     performance boost.
 
+#### Dense instrumentation (LLVM PCGUARD and LTO mode)
+
+By default the coverage instrumentation prunes basic blocks whose execution is
+already implied by an instrumented successor or predecessor (full dominators
+and full post-dominators). Setting `AFL_LLVM_DENSE=1` during compilation
+disables that pruning and instruments every basic block. In LTO mode the same
+thing can also be spelled `-mllvm -lto-coverage-prune-blocks=0`.
+
+This gives a finer partition at the cost of a much larger map - on libraw the
+map grows from 25462 to 38672 entries (+51.9%) for about 5% less throughput.
+Most of the added entries carry no independent signal, so this is a research
+knob: only useful if your target is far below the map size limit and you have
+measured that the extra granularity helps.
+
+#### Clamp instrumentation (LLVM PCGUARD and LTO mode)
+
+At -O2 and above the optimizer turns `MIN()`, `MAX()`, `LIM()` and plain
+`if (x > n) x = n;` into `llvm.smin`/`smax`/`umin`/`umax`/`abs` intrinsics,
+which are branchless and therefore invisible to the edge map. Setting
+`AFL_LLVM_MINMAX=1` during compilation scores each of them like a compare.
+
+On libraw this adds 10.3% map entries, but 45% of the sites are in demosaic and
+postprocessing code that runs per pixel, and there it costs 21% throughput. The
+sites that pay off are the length, count and index guards in parsers, which are
+cold. So this is worth turning on for a parser, and worth measuring first for
+anything doing bulk pixel or signal math.
+
+#### Fused condition instrumentation (LLVM PCGUARD and LTO mode)
+
+`if (a && b)` with a cheap second operand is speculated by SimplifyCFG into a
+single `and i1` feeding one branch, so the map only records whether the compound
+condition held, never which half failed. Setting `AFL_LLVM_FUSED=1` during
+compilation scores each half separately, which gives the fuzzer a gradient for
+solving multi-clause conditions.
+
+On libraw this adds 7.5% map entries for no measurable throughput cost, and its
+sites are mostly in parser code, so it is the cheapest of these three knobs.
+
+#### Vector decision instrumentation (LLVM PCGUARD and LTO mode)
+
+Scalar `select`s are instrumented by default and scalar min/max with
+`AFL_LLVM_MINMAX=1`, their vector counterparts are not instrumented at all.
+Setting `AFL_LLVM_VECTORS=1` during compilation instruments them one guard pair
+per lane, so a `select` on a `<8 x i1>` condition costs 16 map entries instead
+of 0. Vector min/max additionally needs `AFL_LLVM_MINMAX=1`. A bare vector
+compare is never instrumented in either mode - only the `select` or min/max
+intrinsic it feeds is.
+
+Vector decisions come from auto-vectorized loops, where all lanes almost always
+agree and the value being clamped is a pixel rather than a length or an index.
+In PCGUARD mode the pass runs at `OptimizerEarly`, before the loop and SLP
+vectorizers, so auto-vectorized loops hold no vector IR yet and this knob only
+reaches vectors that are explicit in the source (vector extensions, intrinsics,
+`__builtin_elementwise_*`). On libraw there are none at all and the map size is
+unchanged. LTO mode instruments fully optimized IR after the vectorizer and does
+see them. Measure before you keep it on.
+
 #### Thread safe instrumentation counters (in all modes)
 
 Setting `AFL_LLVM_THREADSAFE_INST` will inject code that implements thread safe
@@ -589,6 +648,9 @@ checks or alter some of the more exotic semantics of the tool:
       - `-r 0`: enable runtime value profiling from startup.
       - `-r N`: enable runtime value profiling after `N` seconds without new
         edge coverage, then keep it enabled for the rest of the run.
+      - `-r -1`: enable runtime value profiling once the queue is starved and
+        no new edge coverage was found for a while, then keep it enabled for
+        the rest of the run.
     Value profiling may help when compare operands are transformed in ways
     that make direct solve attempts less effective.
     Notes:
@@ -602,7 +664,10 @@ checks or alter some of the more exotic semantics of the tool:
         is not supported with `-n`, QEMU, Frida, Unicorn, CoreSight, or Nyx
         execution modes.
       - Routine-compare VP features record separate matched-prefix and
-        whole-buffer hamming-distance signals.
+        whole-buffer hamming-distance signals. Substring routines (`strstr`,
+        `strcasestr`, `memmem` and similar) record the minimum of both metrics
+        over every candidate offset in the haystack, so a successful match
+        records distance 0.
 
   - `AFL_IGNORE_SEED_PROBLEMS` will skip over crashes and timeouts in the seeds
     instead of exiting.
@@ -889,7 +954,7 @@ checks or alter some of the more exotic semantics of the tool:
     note that time is halved for -M main nodes.
 
   - `AFL_NO_SYNC` disables any syncing whatsoever and takes priority on all
-    other syncing parameters.
+    other syncing parameters, including a sync forced with `SIGUSR2`.
 
   - Setting `AFL_TARGET_ENV` causes AFL++ to set extra environment variables for
     the target binary. Example: `AFL_TARGET_ENV="VAR1=1 VAR2='a b c'" afl-fuzz
@@ -902,9 +967,14 @@ checks or alter some of the more exotic semantics of the tool:
     the format is different from `AFL_TARGET_ENV`) to apply the environment
     variables to the target and not QEMU.
 
+  - `AFL_TESTCACHE_ENTRIES` is obsolete and ignored. The test case cache is
+    bounded by `AFL_TESTCACHE_SIZE` alone.
+
   - `AFL_TESTCACHE_SIZE` allows you to override the size of `#define
     TESTCASE_CACHE` in config.h. Recommended values are 50-250MB - or more if
-    your fuzzing finds a huge amount of paths for large inputs.
+    your fuzzing finds a huge amount of paths for large inputs. The cache
+    holds the queue entries with the highest selection probability per byte,
+    so a larger value keeps paying off.
 
   - `AFL_TMPDIR` is used to write the `.cur_input` file to if it exists, and in
     the normal output directory otherwise. You would use this to point to a

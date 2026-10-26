@@ -341,7 +341,8 @@ static void usage(u8 *argv0, int more_help) {
       "-'.\n"
       "  -r seconds    - enable value profiling after the given period of\n"
       "                  edge-coverage stagnation; once enabled, it stays\n"
-      "                  active. Use -r0 for always-on VP\n"
+      "                  active. Use -r0 for always-on VP, -r -1 to enable\n"
+      "                  it when the queue starves\n"
       "  -l cmplog_opts - CmpLog configuration values (e.g. \"2ATR\"):\n"
       "                  1=small files, 2=larger files (default), 3=all "
       "files,\n"
@@ -660,14 +661,16 @@ void maybe_sync_fuzzers(afl_state_t *afl, u64 cur_time,
 
   u64 sync_time = afl->is_main_node ? afl->sync_time >> 1 : afl->sync_time;
 
-  if (unlikely(cur_time > sync_time + afl->last_sync_time)) {
+  if (unlikely(cur_time > sync_time + afl->last_sync_time ||
+               afl->sync_requested)) {
 
     u32 sync_interval = afl->is_main_node ? SYNC_INTERVAL / 3 : SYNC_INTERVAL;
 
-    if (NULL == sync_interval_cnt ||
+    if (afl->sync_requested || NULL == sync_interval_cnt ||
         !((*sync_interval_cnt)++ % sync_interval)) {
 
       sync_fuzzers(afl);
+      afl->sync_requested = 0;
 
     }
 
@@ -970,30 +973,40 @@ void afl_parse_commandline(afl_state_t *afl, int argc, char **argv) {
 
         }
 
-        char         *endptr = NULL;
-        unsigned long stag_val;
-        errno = 0;
-        stag_val = strtoul(optarg, &endptr, 10);
-        if (errno == ERANGE || endptr == optarg || *endptr != '\0' ||
-            stag_val > UINT_MAX) {
+        if (strcmp(optarg, "-1") == 0) {
 
-          FATAL(
-              "Invalid -r value '%s'; expected 0 for always-on value "
-              "profiling or a positive number of stagnation seconds.",
-              optarg);
-
-        }
-
-        if (stag_val) {
-
-          afl->value_profile_mode = 2;
+          afl->value_profile_mode = 3;
           afl->value_profile_active = 0;
-          afl->value_profile_stagnation_secs = (u32)stag_val;
 
         } else {
 
-          afl->value_profile_mode = 1;
-          afl->value_profile_active = 1;
+          char         *endptr = NULL;
+          unsigned long stag_val;
+          errno = 0;
+          stag_val = strtoul(optarg, &endptr, 10);
+          if (errno == ERANGE || endptr == optarg || *endptr != '\0' ||
+              stag_val > UINT_MAX) {
+
+            FATAL(
+                "Invalid -r value '%s'; expected 0 for always-on value "
+                "profiling, -1 to enable it when starved, or a positive "
+                "number of stagnation seconds.",
+                optarg);
+
+          }
+
+          if (stag_val) {
+
+            afl->value_profile_mode = 2;
+            afl->value_profile_active = 0;
+            afl->value_profile_stagnation_secs = (u32)stag_val;
+
+          } else {
+
+            afl->value_profile_mode = 1;
+            afl->value_profile_active = 1;
+
+          }
 
         }
 
@@ -1789,6 +1802,12 @@ void afl_check_environment(afl_state_t *afl) {
   #ifdef __linux__
   if (afl->fsrv.nyx_mode) {
 
+    if (afl->non_instrumented_mode) {
+
+      FATAL("-n is not supported in Nyx mode");
+
+    }
+
     if (afl->fsrv.nyx_standalone && strcmp(afl->sync_id, "default") != 0) {
 
       FATAL(
@@ -1882,6 +1901,16 @@ void afl_check_environment(afl_state_t *afl) {
       FATAL(
           "Value profiling (-r) currently requires an LLVM-instrumented main "
           "target and cannot be combined with binary-only execution modes.");
+
+    }
+
+    if (afl->cmplog_binary && !strcmp("0", (char *)afl->cmplog_binary)) {
+
+      WARNF(
+          "-c 0 reuses the main target as the CmpLog binary, but a target "
+          "built with AFL_LLVM_VALUE_PROFILE=1 has no CmpLog instrumentation. "
+          "CmpLog will collect nothing. Build a separate CmpLog binary and "
+          "pass it with -c <binary>.");
 
     }
 
@@ -1994,9 +2023,13 @@ void afl_check_environment(afl_state_t *afl) {
 
     }
 
+    vp_focus_init(afl);
+
     OKF("Value profiling: mode %u%s, slots %u, source=%s",
         afl->value_profile_mode,
-        afl->value_profile_mode == 1 ? " (always on)" : " (stagnation)",
+        afl->value_profile_mode == 1
+            ? " (always on)"
+            : (afl->value_profile_mode == 3 ? " (starved)" : " (stagnation)"),
         VP_SLOTS, "runtime-shm");
 
   }
@@ -2051,17 +2084,7 @@ void afl_check_environment(afl_state_t *afl) {
 
   if (afl->afl_env.afl_testcache_entries) {
 
-    afl->q_testcase_max_cache_entries =
-        (u32)atoi(afl->afl_env.afl_testcache_entries);
-
-    // user_set_cache = 1;
-
-  }
-
-  if (!afl->afl_env.afl_testcache_size || !afl->afl_env.afl_testcache_entries) {
-
-    afl->afl_env.afl_testcache_entries = 0;
-    afl->afl_env.afl_testcache_size = 0;
+    ACTF("AFL_TESTCACHE_ENTRIES is obsolete and ignored");
 
   }
 
@@ -2670,6 +2693,22 @@ void afl_setup_environment(afl_state_t *afl) {
   }
 
   // read_foreign_testcases(afl, 1); for the moment dont do this
+  /* That call is disabled, so nothing else ever announces -F. List the
+     directories here: a typo in a foreign sync path is otherwise invisible
+     for the whole run. */
+  if (afl->foreign_sync_cnt) {
+
+    u32 fs_i;
+    for (fs_i = 0; fs_i < afl->foreign_sync_cnt; fs_i++) {
+
+      ACTF("Foreign sync %u: '%s'%s", fs_i, afl->foreign_syncs[fs_i].dir,
+           access(afl->foreign_syncs[fs_i].dir, R_OK) ? " (NOT READABLE YET)"
+                                                      : "");
+
+    }
+
+  }
+
   OKF("Loaded a total of %u seeds.", afl->queued_items);
 
   /* If we don't have a file name chosen yet, use a safe default. */
@@ -2730,6 +2769,21 @@ void afl_setup_environment(afl_state_t *afl) {
         afl->fsrv.target_path = saved_target_path;
 
       }
+
+    }
+
+  }
+
+  if (afl->fsrv.target_path) {
+
+    if (afl->cmplog_binary) {
+
+      OKF("Coverage target: %s (CmpLog: %s)", afl->fsrv.target_path,
+          afl->cmplog_binary);
+
+    } else {
+
+      OKF("Coverage target: %s", afl->fsrv.target_path);
 
     }
 
@@ -3143,6 +3197,10 @@ void afl_alloc_shared_memory(afl_state_t *afl) {
 
     if (restore_ijon_env) { unsetenv("AFL_NO_IJON"); }
 
+    /* Starting the forkserver already ran the CmpLog binary once, so the
+       shared trace buffer no longer holds the coverage target's map. */
+    // afl->primary_trace = 0;
+
     OKF("CMPLOG forkserver successfully started");
 
   }
@@ -3295,9 +3353,11 @@ void afl_load_seeds(afl_state_t *afl) {
 
         if (!q->was_fuzzed) { --afl->pending_not_fuzzed; }
         --afl->active_items;
+        ++afl->disabled_items;
 
       }
 
+      if (q->vp_only) { ++afl->vp_only_items; }
       if (q->var_behavior) { ++afl->queued_variable; }
       if (q->favored) {
 
@@ -3469,14 +3529,6 @@ void afl_load_seeds(afl_state_t *afl) {
       usleep(1000);
 
     }
-
-  }
-
-  if (afl->q_testcase_max_cache_entries) {
-
-    afl->q_testcase_cache =
-        ck_alloc(afl->q_testcase_max_cache_entries * sizeof(size_t));
-    if (!afl->q_testcase_cache) { PFATAL("malloc failed for cache entries"); }
 
   }
 
@@ -3655,7 +3707,7 @@ void stop_fuzzing(afl_state_t *afl) {
        time_spent_working / afl->fsrv.total_execs);
   #endif
 
-  if (afl->afl_env.afl_final_sync) {
+  if (afl->afl_env.afl_final_sync && afl->sync_id) {
 
     SAYF(cYEL "[!] " cRST
               "\nPerforming final sync, this make take some time ...\n");
@@ -3856,7 +3908,6 @@ void stop_fuzzing(afl_state_t *afl) {
   ck_free(afl->fsrv.target_path);
   if (afl->fsrv.out_file) { ck_free(afl->fsrv.out_file); }
   ck_free(afl->sync_id);
-  if (afl->q_testcase_cache) { ck_free(afl->q_testcase_cache); }
 
   char **argv_cpy = afl->argv_cpy;
 

@@ -46,6 +46,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
+from statistics import median
 from typing import Any
 
 __version__ = "0.1"
@@ -137,6 +138,8 @@ class Trend:
     edges_slope_recent_per_min: float
     execs_per_sec_now: float
     execs_per_sec_peak: float
+    execs_per_sec_recent: float
+    execs_per_sec_baseline: float
     last_cov_entry_age_s: int | None
     last_find_age_s: int | None
     expected_eps: float | None = None
@@ -217,7 +220,7 @@ class ActionDirective:
 @dataclass
 class Report:
     snapshot: CampaignSnapshot
-    overall: str  # healthy | degraded | stalled | misconfigured | dead | collection_error
+    overall: str  # healthy | degraded | stalled | misconfigured | dead | no_instances | collection_error
     verdict_explainer: str
     findings: list[Finding] = field(default_factory=list)
     actions: list[ActionDirective] = field(default_factory=list)
@@ -334,6 +337,9 @@ def _to_float(value: str) -> float:
         return 0.0
 
 
+EPS_MIN_SAMPLES = 10  # plot_data samples below which a self-relative rate judgment is not meaningful
+
+
 def parse_plot_data(text: str) -> dict[str, float | int]:
     """Header-indexed trend from ``plot_data``.
 
@@ -341,6 +347,14 @@ def parse_plot_data(text: str) -> dict[str, float | int]:
     ``execs_per_sec``, ``relative_time`` by *name*. Returns peak vs now for edges
     and execs/sec plus the edge slope (edges/min) over the last 25% of the run.
     ``rows == 0`` means no usable data (trend source ``none``).
+
+    The two execs/sec *judgment* values are medians, not extremes: ``recent`` over the
+    last 25% of the run and ``baseline`` over everything collected. plot_data's
+    execs_per_sec is a smoothed instantaneous rate, so single rows swing wide with the
+    input being fuzzed; and a campaign's rate legitimately decays as its seeds get
+    deeper, which makes the all-time peak an unreachable reference. Median vs median
+    compares the campaign against its own recent norm instead. ``baseline`` is 0.0
+    below ``EPS_MIN_SAMPLES`` usable rows — too little history to judge against.
     """
     cols: dict[str, int] = {}
     rows: list[list[str]] = []
@@ -362,6 +376,8 @@ def parse_plot_data(text: str) -> dict[str, float | int]:
         "edges_found_peak": 0,
         "execs_per_sec_now": 0.0,
         "execs_per_sec_peak": 0.0,
+        "execs_per_sec_recent": 0.0,
+        "execs_per_sec_baseline": 0.0,
         "edges_slope_recent_per_min": 0.0,
     }
     if not rows or not cols:
@@ -392,6 +408,11 @@ def parse_plot_data(text: str) -> dict[str, float | int]:
     dt = ts[-1] - ts[wi]
     de = efs[-1] - efs[wi]
     out["edges_slope_recent_per_min"] = (de / (dt / 60.0)) if dt > 0 else 0.0
+
+    live = [e for e in epss if e > 0]
+    recent = [e for e in epss[wi:] if e > 0]
+    out["execs_per_sec_recent"] = median(recent) if recent else 0.0
+    out["execs_per_sec_baseline"] = median(live) if len(live) >= EPS_MIN_SAMPLES else 0.0
     return out
 
 
@@ -433,13 +454,19 @@ def classify_death(inst: Instance, raw: RawInstance, *, generation_start: int | 
                   afl-fuzz itself, a FATAL, or the machine going down.
     ``unknown``   no marker is available (AFL++ < 4.22a, or AFL_NO_FASTRESUME suppressed
                   it), so a clean exit cannot be ruled out either way.
+    ``unreadable``
+                  fuzzer_stats itself could not be read, so nothing about this instance,
+                  liveness included, can be determined.
 
     ``generation_start`` is the start_time of the earliest *freshly reporting* instance:
     liveness alone cannot define it, since an instance that was stopped moments ago still
     belongs to the generation its siblings are running in.
 
-    Only ``killed`` and ``unknown`` reflect badly on the campaign.
+    Only ``killed`` and ``unknown`` reflect badly on the campaign; ``unreadable`` reflects
+    on the collection, not on the campaign.
     """
+    if not raw.fuzzer_stats:
+        return "unreadable"
     if generation_start is not None and 0 < inst.start_time < generation_start and last_update < generation_start:
         return "leftover"
     if raw.fastresume_present:
@@ -506,7 +533,7 @@ def build_snapshot(raw: RawCampaign, *, no_pids: bool = False) -> CampaignSnapsh
 
         roles[role] = roles.get(role, 0) + 1
         variants[variant] = variants.get(variant, 0) + 1
-        absent = [f for f in _WATCHED_OPTIONAL if f not in kv]
+        absent = [f for f in _WATCHED_OPTIONAL if f not in kv] if kv else []
 
         instances.append(
             Instance(
@@ -594,6 +621,8 @@ def build_snapshot(raw: RawCampaign, *, no_pids: bool = False) -> CampaignSnapsh
         edges_slope_recent_per_min=float(pt["edges_slope_recent_per_min"]),
         execs_per_sec_now=float(pt["execs_per_sec_now"]),
         execs_per_sec_peak=float(pt["execs_per_sec_peak"]),
+        execs_per_sec_recent=float(pt["execs_per_sec_recent"]),
+        execs_per_sec_baseline=float(pt["execs_per_sec_baseline"]),
         last_cov_entry_age_s=last_cov_age,
         last_find_age_s=last_find_age,
     )
@@ -622,7 +651,7 @@ def build_snapshot(raw: RawCampaign, *, no_pids: bool = False) -> CampaignSnapsh
 # ============================================================================
 # analyze — snapshot (+ optional history) -> verdict, findings, directives.
 #
-# All rate/size judgments are self-relative (vs the campaign's own plot_data peak,
+# All rate/size judgments are self-relative (vs the campaign's own plot_data norm,
 # prior snapshots, or an optional expected eps). The only absolute judgments are
 # objective/degenerate (execs==0, edges==0, dead) and AFL-normalized (stability
 # bands, bitmap saturation). Read-only: directives are emitted, never executed.
@@ -634,7 +663,10 @@ FLAT_SLOPE = 0.5  # edges/min at/under which growth is too slow to rule out a pl
 SATURATION_CVG = 99.5
 CORE_BYTES_WARN = 2 * 1024**3  # 2 GB of .core dumps
 THROUGHPUT_RUNTIME = 6 * 3600  # only call a campaign "throughput-bound" after this long
-EPS_DROP_FRACTION = 0.5  # execs/sec below this fraction of its own peak = slowdown
+# A campaign's exec rate falls off naturally as its seeds reach deeper, so only a
+# sustained collapse below a quarter of its own recent norm (median vs median, see
+# parse_plot_data) counts as a slowdown - not the slow drift away from an early peak.
+EPS_DROP_FRACTION = 0.25
 
 DEGRADED_REASON_TEXT = {
     "dead-instances": "instance(s) died unexpectedly",
@@ -646,6 +678,8 @@ DEATH_UNEXPECTED = ("killed", "unknown", "")
 DEATH_ORDER = ("killed", "unknown", "stopped", "leftover")
 
 DEATH_CAUSE = {
+    "unreadable": "fuzzer_stats could not be read: permissions (campaign owned by another user) "
+    "or the file went away mid-collection",
     "killed": "OOM-killed, SIGKILL, a crash of afl-fuzz itself, a FATAL, or the machine went down",
     "unknown": "no clean-exit marker available (AFL++ < 4.22a or AFL_NO_FASTRESUME) — cause undeterminable",
     "stopped": "shut down cleanly: stopped by the user, or a -V/-E limit was reached",
@@ -654,6 +688,7 @@ DEATH_CAUSE = {
 }
 
 DEATH_ISSUE = {
+    "unreadable": "fuzzer_stats unreadable; state undeterminable",
     "killed": "died unexpectedly (no clean-exit marker)",
     "unknown": "not running; clean exit could not be confirmed",
     "stopped": "stopped cleanly (user stop or -V/-E limit)",
@@ -689,6 +724,16 @@ def analyze(
             snap, "collection_error", snap.collection_error, notes=[f"collection failed: {snap.collection_error}"]
         )
 
+    if snap.instance_count == 0:
+        explainer = (
+            f"No fuzzer_stats found under {snap.output_dir} (searched 3 levels deep) — not an "
+            "AFL++/cargo-afl/ziggy output directory, a campaign that never got as far as writing stats, "
+            "or stats that this user may not read. Nothing was measured, so nothing is claimed about health."
+        )
+        if snap.honggfuzz_present:
+            explainer += " A ziggy honggfuzz instance is present but is not interpreted (out of scope)."
+        return Report(snap, "no_instances", explainer, notes=[explainer])
+
     findings: list[Finding] = []
     actions: list[ActionDirective] = []
     notes: list[str] = []
@@ -699,7 +744,7 @@ def analyze(
     alive = [i for i in snap.instances if i.alive]
     dead = [i for i in snap.instances if not i.alive]
     died = [i for i in dead if i.death in DEATH_UNEXPECTED]
-    idle = [i for i in dead if i.death not in DEATH_UNEXPECTED]
+    idle = [i for i in dead if i.death not in DEATH_UNEXPECTED and i.death != "unreadable"]
     t = snap.trend
     pending_favs_total = snap.pending_favs_total()
     cycles_max = max((i.cycles_done for i in snap.instances), default=0)
@@ -809,7 +854,30 @@ def analyze(
         if not i.alive:
             status = i.death or "dead"
             issues.append(DEATH_ISSUE.get(i.death, "not running"))
-            if i.death in DEATH_UNEXPECTED:
+            if i.death == "unreadable":
+                findings.append(
+                    Finding(
+                        "medium",
+                        "instance",
+                        i.name,
+                        "fuzzer_stats could not be read",
+                        DEATH_CAUSE["unreadable"],
+                    )
+                )
+                actions.append(
+                    ActionDirective(
+                        "fix_stats_access",
+                        "medium",
+                        "instance",
+                        _target(snap, i.name),
+                        "fuzzer_stats is unreadable, so this instance cannot be assessed at all",
+                        {"death": i.death},
+                        suggested_command="check access to "
+                        f"{snap.output_dir}{'/afl' if snap.layout == 'ziggy-afl-subdir' else ''}"
+                        f"/{i.name}/fuzzer_stats",
+                    )
+                )
+            elif i.death in DEATH_UNEXPECTED:
                 findings.append(
                     Finding(
                         "medium" if alive else "high",
@@ -880,14 +948,17 @@ def analyze(
         i.status = status
         i.issues = issues
 
-    if t.execs_per_sec_peak > 0 and 0 < t.execs_per_sec_now < EPS_DROP_FRACTION * t.execs_per_sec_peak:
+    eps_reference = expected_eps or t.execs_per_sec_baseline
+    if eps_reference > 0 and 0 < t.execs_per_sec_recent < EPS_DROP_FRACTION * eps_reference:
         eps_drop = True
+        against = "the expected rate" if expected_eps else "its own recent norm"
         findings.append(
             Finding(
                 "medium",
                 "campaign",
                 None,
-                f"execs/sec {t.execs_per_sec_now:.0f} is far below its own peak {t.execs_per_sec_peak:.0f}",
+                f"execs/sec {t.execs_per_sec_recent:.0f} over the last 25% of the run is far "
+                f"below {against} ({eps_reference:.0f})",
                 "slow inputs accumulating, sync overhead, or a slow path",
             )
         )
@@ -897,8 +968,12 @@ def analyze(
                 "medium",
                 "campaign",
                 _target(snap),
-                "recent exec rate dropped well below the campaign's own peak",
-                {"eps_now": t.execs_per_sec_now, "eps_peak": t.execs_per_sec_peak},
+                f"recent exec rate dropped to under a quarter of {against}",
+                {
+                    "eps_recent": t.execs_per_sec_recent,
+                    "eps_reference": eps_reference,
+                    "eps_peak": t.execs_per_sec_peak,
+                },
                 suggested_command="verify persistent mode; afl-persistent-config + afl-system-config; raise AFL_TESTCACHE_SIZE",
             )
         )
@@ -1016,13 +1091,13 @@ def analyze(
         overall = "misconfigured"
     elif n > 0 and snap.alive_count == 0:
         overall = "dead"
-    elif degraded_reasons:
-        overall = "degraded"
     elif plateau:
         overall = "stalled"
+    elif degraded_reasons:
+        overall = "degraded"
     else:
         overall = "healthy"
-    if overall != "degraded":
+    if overall not in ("degraded", "stalled"):
         degraded_reasons = []
 
     headline = _headline(
@@ -1100,7 +1175,7 @@ def _headline(
 
 
 def degraded_tag(reasons: list[str]) -> str:
-    """The single-word reason tags of a degraded verdict, joined for one-line output."""
+    """The single-word degradation reason tags, joined for one-line output."""
     return "+".join(reasons)
 
 
@@ -1129,10 +1204,11 @@ def _explain(
         )
         return f"{alive}, but a subset is unwell ({why})."
     if overall == "stalled":
+        why = ", ".join(DEGRADED_REASON_TEXT.get(r, r) for r in degraded_reasons or [])
         return (
             f"{alive} and running, but coverage plateaued: edge slope "
             f"~{t.edges_slope_recent_per_min:.1f}/min, last +cov {t.last_cov_entry_age_s}s ago, "
-            f"favored queue drained."
+            f"favored queue drained." + (f" A subset is also unwell ({why})." if why else "")
         )
     tail = " Throughput-bound: still gaining coverage, just slowly (exec-speed limited)." if throughput_bound else ""
     return f"{alive}; coverage progressing and stability OK.{tail}"
@@ -1149,7 +1225,15 @@ EXIT = {
     "stalled": 1,
     "misconfigured": 2,
     "dead": 2,
+    "no_instances": 3,
     "collection_error": 3,
+}
+
+# Verdicts where no instance was read at all: every metric would be a fake zero, so
+# these report the reason instead of a header block, a table and a trend.
+NOTHING_MEASURED = {
+    "no_instances": "NO INSTANCES",
+    "collection_error": "COLLECTION ERROR",
 }
 
 
@@ -1158,10 +1242,10 @@ def exit_code(reports: list[Report]) -> int:
 
 
 def fleet_verdict(reports: list[Report]) -> str:
-    """The worst verdict across the fleet (by exit-code rank)."""
+    """The worst verdict across the fleet (by exit-code rank; stalled wins its tie with degraded)."""
     if not reports:
         return "healthy"
-    return max(reports, key=lambda r: EXIT.get(r.overall, 0)).overall
+    return max(reports, key=lambda r: (EXIT.get(r.overall, 0), r.overall == "stalled")).overall
 
 
 def render_json(reports: list[Report], *, now: int, version: str) -> str:
@@ -1257,8 +1341,8 @@ def _wrap_labels(labels: list[str], indent: str, width: int = 92) -> list[str]:
 
 def render_text(report: Report, summary: bool = False) -> str:
     s = report.snapshot
-    if report.overall == "collection_error":
-        return f"=== {s.campaign_id} ===\nCOLLECTION ERROR: {report.verdict_explainer}\n"
+    if report.overall in NOTHING_MEASURED:
+        return f"=== {s.campaign_id} ===\n{NOTHING_MEASURED[report.overall]}: {report.verdict_explainer}\n"
 
     hl = report.headline
     tc = _toolchain_label(s.toolchain)
@@ -1322,11 +1406,12 @@ def render_text(report: Report, summary: bool = False) -> str:
         if t.cross_run and t.cross_run.get("edges_delta") is not None:
             delta = f", Δ{t.cross_run['edges_delta']:+d} edges since last run"
         cov = "n/a" if t.last_cov_entry_age_s is None else _hm(t.last_cov_entry_age_s)
+        norm = f"{t.execs_per_sec_baseline:.1f}" if t.execs_per_sec_baseline > 0 else "n/a"
         total_edges = max((i.total_edges for i in s.instances), default=0)
         lines.append(
             f"Trend [source: {t.source}]: edges {t.edges_found_now}/{total_edges} (peak {t.edges_found_peak}, "
             f"{t.edges_slope_recent_per_min:+.1f}/min), +cov age {cov}, "
-            f"exec/s {t.execs_per_sec_now:.1f}/{t.execs_per_sec_peak:.1f}{delta}",
+            f"exec/s {t.execs_per_sec_recent:.1f} (norm {norm}, peak {t.execs_per_sec_peak:.1f}){delta}",
         )
         lines.append(
             f"Crashes: {s.crashes.total} ({s.crashes.hangs_total} hangs)"
@@ -1410,6 +1495,15 @@ class TrendStore:
     def save(self, report: Report) -> None:
         s = report.snapshot
         t = s.trend
+        if report.overall in NOTHING_MEASURED:
+            # No instance was read: store the verdict only, with NULL metrics, so the next
+            # run's cross-run delta is suppressed instead of computed against fake zeros.
+            self._conn.execute(
+                "INSERT INTO snapshots (campaign_id, generated_at, verdict, raw_json) VALUES (?,?,?,?)",
+                (s.campaign_id, s.generated_at, report.overall, json.dumps(report.to_dict())),
+            )
+            self._conn.commit()
+            return
         self._conn.execute(
             "INSERT INTO snapshots (campaign_id, generated_at, run_time_s, edges_found, "
             "eps_now, eps_peak, corpus_count, pending_favs, crashes, hangs, last_cov_age_s, "
@@ -1452,7 +1546,9 @@ class TrendStore:
 # needs nothing beyond sh + coreutils; we never transfer corpora or core dumps —
 # only fuzzer_stats, a plot_data tail, the newest +cov mtime, and crash/hang/core
 # counts. The collector emits a length-prefixed, binary-safe dump that parse_dump
-# turns into a RawCampaign.
+# turns into a RawCampaign. Every blob length is measured from the same snapshot
+# that is written out, because afl-fuzz replaces fuzzer_stats by rename(): reading
+# the file twice can see two different inodes and would desync the stream.
 # ============================================================================
 
 # POSIX-sh collector. $1 = campaign output dir. Honours $AFL_HEALTH_NOW for tests.
@@ -1525,9 +1621,13 @@ printf '%s\n' "$stats" | while IFS= read -r f; do
   printf 'FASTRESUME %s\n' "$fr"
   printf 'MAINNODEFILE %s\n' "$mn"
   printf 'NOFASTRESUME %s\n' "$nf"
-  sn=$(wc -c < "$f" | tr -d ' ')
-  printf 'BLOB stats %s\n' "$sn"
-  cat "$f"
+  if st=$(cat "$f" 2>/dev/null); then
+    sn=$(printf '%s\n' "$st" | wc -c | tr -d ' ')
+    printf 'BLOB stats %s\n' "$sn"
+    printf '%s\n' "$st"
+  else
+    printf 'BLOB stats 0\n'
+  fi
   if [ -f "$d/plot_data" ]; then
     pt=$( { head -n1 "$d/plot_data"; tail -n 200 "$d/plot_data"; } )
     pn=$(printf '%s' "$pt" | wc -c | tr -d ' ')
@@ -1540,6 +1640,10 @@ printf '%s\n' "$stats" | while IFS= read -r f; do
 done
 printf 'END\n'
 """
+
+
+class DumpFormatError(Exception):
+    """The collector output did not follow the length-prefixed dump protocol."""
 
 
 @dataclass
@@ -1602,7 +1706,10 @@ def collect(target: Target, *, now_override: int | None = None, no_pids: bool = 
     if not out.startswith((b"CAMPAIGN", b"ERROR")):
         stderr = proc.stderr.decode("utf-8", "replace").strip()
         return _err(target, stderr or f"collector exited {proc.returncode}", now_override)
-    raw = parse_dump(out, host=target.host)
+    try:
+        raw = parse_dump(out, host=target.host, output_dir=target.output_dir)
+    except DumpFormatError as e:
+        return _err(target, f"malformed collector output: {e}", now_override)
     if now_override is not None:
         raw.now = now_override
     return raw
@@ -1617,7 +1724,15 @@ def _opt_mtime(token: str) -> float | None:
     return value if value > 0 else None
 
 
-def parse_dump(data: bytes, *, host: str) -> RawCampaign:
+def _opt_count(token: str) -> int:
+    """A count field from the collector; absent or non-numeric becomes 0."""
+    try:
+        return int(token.strip())
+    except ValueError:
+        return 0
+
+
+def parse_dump(data: bytes, *, host: str, output_dir: str = "") -> RawCampaign:
     pos = 0
 
     def read_line() -> str:
@@ -1641,10 +1756,28 @@ def parse_dump(data: bytes, *, host: str) -> RawCampaign:
         parts = read_line().split(" ", 1)
         return parts[1] if len(parts) > 1 else ""
 
+    def read_blob(kind: str) -> str:
+        header = read_line()
+        parts = header.split()
+        if len(parts) != 3 or parts[0] != "BLOB" or parts[1] != kind or not parts[2].isdigit():
+            raise DumpFormatError(f"expected 'BLOB {kind} <len>', got {header[:60]!r}")
+        n = int(parts[2])
+        blob = read_bytes(n)
+        if len(blob) != n:
+            raise DumpFormatError(f"{kind} blob truncated: want {n} bytes, got {len(blob)}")
+        return blob.decode("utf-8", "replace")
+
     first = read_line()
     if first.startswith("ERROR"):
         return RawCampaign(
-            f"{host}:?", host, "", 0, "flat", honggfuzz_present=False, collection_error=first, instances=[]
+            f"{host}:{output_dir or '?'}",
+            host,
+            output_dir,
+            0,
+            "flat",
+            honggfuzz_present=False,
+            collection_error=first,
+            instances=[],
         )
 
     meta = dict(tok.split("=", 1) for tok in first.split()[1:] if "=" in tok)
@@ -1665,18 +1798,17 @@ def parse_dump(data: bytes, *, host: str) -> RawCampaign:
         pid_alive = field_after_space() == "1"
         cov_mtime = _opt_mtime(field_after_space())
         queue_mtime = _opt_mtime(field_after_space())
-        crash_count = int(field_after_space() or 0)
-        hang_count = int(field_after_space() or 0)
-        core_bytes = int(field_after_space() or 0)
+        crash_count = _opt_count(field_after_space())
+        hang_count = _opt_count(field_after_space())
+        core_bytes = _opt_count(field_after_space())
         fastresume = field_after_space() == "1"
         main_node_file = field_after_space() == "1"
         no_fastresume_env = field_after_space() == "1"
-        b = read_line().split()  # BLOB stats N
-        stats = read_bytes(int(b[2])).decode("utf-8", "replace")
-        b = read_line().split()  # BLOB plot N
-        nplot = int(b[2])
-        plot = read_bytes(nplot).decode("utf-8", "replace") if nplot > 0 else None
-        read_line()  # ENDINSTANCE
+        stats = read_blob("stats")
+        plot = read_blob("plot") or None
+        end = read_line()
+        if end != "ENDINSTANCE":
+            raise DumpFormatError(f"expected 'ENDINSTANCE' after {name}, got {end[:60]!r}")
         instances.append(
             RawInstance(
                 name,
@@ -1920,8 +2052,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--summary",
         action="store_true",
-        help="condensed one-line per campaign (fleet roll-up for many); a degraded campaign names "
-        "its reason(s): " + " / ".join(DEGRADED_REASON_TEXT),
+        help="condensed one-line per campaign (fleet roll-up for many); a degraded or stalled campaign "
+        "names its degradation reason(s): " + " / ".join(DEGRADED_REASON_TEXT),
     )
     g = p.add_mutually_exclusive_group()
     g.add_argument("-r", "--running", "-a", "--alive", action="store_true", help="show only running/alive campaigns (>=1 instance alive)")
@@ -1978,6 +2110,10 @@ def _fleet_summary(reports: list[Report]) -> str:
     lines = [f"FLEET verdict: {fleet_verdict(reports).upper()}  ({len(reports)} campaigns)", ""]
     for r in reports:
         s = r.snapshot
+        if r.overall in NOTHING_MEASURED:
+            reason = r.verdict_explainer.split(" — ")[0].split("(")[0].strip()
+            lines.append(f"  {r.overall.upper():<14} {s.campaign_id}  (nothing measured: {reason})")
+            continue
         why = f", degraded: {degraded_tag(r.degraded_reasons)}" if r.degraded_reasons else ""
         lines.append(
             f"  {r.overall.upper():<14} {s.campaign_id}  "

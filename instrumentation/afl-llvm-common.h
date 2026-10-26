@@ -47,6 +47,7 @@
 #endif
 
 #include "llvm/IR/DebugInfo.h"
+#include "llvm/IR/MDBuilder.h"
 #include "llvm/IR/CFG.h"
 
 #define MNAME M.getSourceFileName()
@@ -69,6 +70,59 @@ CompareObserverMode getCompareObserverModeFromEnv();
 inline bool         isValueProfileMode(CompareObserverMode mode) {
 
   return mode == CompareObserverMode::ValueProfile;
+
+}
+
+inline bool isMemcmpRoutineName(llvm::StringRef Name) {
+
+  return Name == "memcmp" || Name == "bcmp" || Name == "CRYPTO_memcmp" ||
+         Name == "OPENSSL_memcmp" || Name == "memcmp_const_time" ||
+         Name == "memcmpct";
+
+}
+
+inline bool isStrcmpRoutineName(llvm::StringRef Name) {
+
+  return Name == "strcmp" || Name == "xmlStrcmp" || Name == "xmlStrEqual" ||
+         Name == "g_strcmp0" || Name == "curl_strequal" ||
+         Name == "strcsequal" || Name == "g_str_has_prefix" ||
+         Name == "g_str_has_suffix";
+
+}
+
+inline bool isStrcasecmpRoutineName(llvm::StringRef Name) {
+
+  return Name == "strcasecmp" || Name == "stricmp" ||
+         Name == "ap_cstr_casecmp" || Name == "apr_cstr_casecmp" ||
+         Name == "OPENSSL_strcasecmp" || Name == "xmlStrcasecmp" ||
+         Name == "g_strcasecmp" || Name == "g_ascii_strcasecmp" ||
+         Name == "Curl_strcasecompare" || Name == "Curl_safe_strcasecompare" ||
+         Name == "cmsstrcasecmp" || Name == "sqlite3_stricmp" ||
+         Name == "sqlite3StrICmp";
+
+}
+
+inline bool isStrncmpRoutineName(llvm::StringRef Name) {
+
+  return Name == "strncmp" || Name == "xmlStrncmp" || Name == "curl_strnequal";
+
+}
+
+inline bool isStrncasecmpRoutineName(llvm::StringRef Name) {
+
+  return Name == "strncasecmp" || Name == "strnicmp" ||
+         Name == "ap_cstr_casecmpn" || Name == "apr_cstr_casecmpn" ||
+         Name == "OPENSSL_strncasecmp" || Name == "xmlStrncasecmp" ||
+         Name == "g_ascii_strncasecmp" || Name == "Curl_strncasecompare" ||
+         Name == "g_strncasecmp" || Name == "sqlite3_strnicmp";
+
+}
+
+inline bool isCompareResultRoutineName(llvm::StringRef Name) {
+
+  return isMemcmpRoutineName(Name) || isStrcmpRoutineName(Name) ||
+         isStrcasecmpRoutineName(Name) || isStrncmpRoutineName(Name) ||
+         isStrncasecmpRoutineName(Name);
 
 }
 
@@ -222,6 +276,10 @@ unsigned long long int calculateCollisions(uint32_t edges);
 void                   scanForDangerousFunctions(llvm::Module *M);
 unsigned int           calcCyclomaticComplexity(llvm::Function *F);
 bool                   isAflCovInterestingInstruction(llvm::Instruction &I);
+bool                   isAflCovMinMaxIntrinsic(llvm::Instruction &I);
+bool                   isAflCovMinMaxEnabled(void);
+bool                   isAflCovVectorEnabled(void);
+bool                   isAflCovFusedEnabled(void);
 bool                   isDecisionUse(const llvm::Value *Cond);
 bool                   isExecCall(llvm::Instruction *IN);
 std::pair<bool, bool>  detectIJONUsage(llvm::Module &M);
@@ -355,8 +413,9 @@ inline bool isFullyArtificialBlock(const llvm::BasicBlock *BB) {
    sees or displaces this load.  The load is marked invariant because
    __afl_area_ptr is set once at process start and never changes.
 
-   Callers should collect BlocksToInstrument before calling this so the
-   preamble is excluded from instrumentation. */
+   The preamble is marked synthetic so shouldInstrumentBlock() skips it even
+   when block pruning is off - instrumenting it would insert a map access
+   ahead of the load it depends on. */
 inline llvm::Value *hoistMapPointerLoad(llvm::Function       &F,
                                         llvm::GlobalVariable *AFLMapPtr,
                                         llvm::Type           *PtrTy) {
@@ -381,6 +440,7 @@ inline llvm::Value *hoistMapPointerLoad(llvm::Function       &F,
   setNoSanitizeMetadata(Load);
   Load->setMetadata(LLVMContext::MD_invariant_load, MDNode::get(Ctx, {}));
   IRB.CreateBr(OldEntry);
+  markAflSyntheticBlock(Preamble);
 
   /* Move static allocas into the preamble so ASan keeps them function-wide. */
   for (auto *AI : StaticAllocas) {
@@ -398,14 +458,19 @@ inline llvm::Value *hoistMapPointerLoad(llvm::Function       &F,
 }
 
 /* Load the per-exec VP enabled byte from a runtime-exported pointer and return
-   `enabled != 0`. Both loads are volatile because the fuzzer updates this
-   shared-memory control byte between target executions. */
+   `enabled != 0`. The byte load stays volatile because the fuzzer updates
+   this shared-memory control byte between target executions and a
+   persistent-mode child must observe it. The pointer load does not: it is
+   only ever reassigned from inside the AFL runtime itself (shared-memory
+   attach/detach, selective-coverage toggles), always through opaque
+   external calls that already force a reload, so a plain load here is both
+   correct and CSE-able (and for that same reason !invariant.load must not
+   be added). */
 inline llvm::Value *createValueProfileEnabledGuard(
     llvm::IRBuilder<> &IRB, llvm::GlobalVariable *vp_enabled_ptr,
     llvm::Type *PtrTy, llvm::Type *Int8Ty) {
 
   auto *EnabledBytePtr = IRB.CreateLoad(PtrTy, vp_enabled_ptr);
-  EnabledBytePtr->setVolatile(true);
   setNoSanitizeMetadata(EnabledBytePtr);
 
   auto *EnabledValue = IRB.CreateLoad(Int8Ty, EnabledBytePtr);
@@ -416,7 +481,20 @@ inline llvm::Value *createValueProfileEnabledGuard(
       EnabledValue,
       llvm::ConstantInt::get(llvm::cast<llvm::IntegerType>(Int8Ty), 0)));
   setNoSanitizeMetadata(IsEnabled);
+  /* afl.skip keeps a later compare-observer pass from value-profiling this
+     guard itself. The switch pass runs first, so without it every guarded
+     switch site also emits a bogus 8-bit compare hook on the enabled byte. */
+  setAflSkipMetadata(IsEnabled);
   return IsEnabled;
+
+}
+
+/* Value profiling is off unless the fuzzer switches it on, so the guarded hook
+   block is cold: weight it so the enabled test falls through on the hot path
+   and the call is laid out away from it. */
+inline llvm::MDNode *createValueProfileGuardWeights(llvm::LLVMContext &Ctx) {
+
+  return llvm::MDBuilder(Ctx).createBranchWeights(1, 1u << 20);
 
 }
 

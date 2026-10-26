@@ -80,6 +80,7 @@ void vp_mark_entry_vp_only(afl_state_t *afl, struct queue_entry *q) {
 
   if (!q) return;
 
+  if (!q->vp_only) { ++afl->vp_only_items; }
   q->vp_only = 1;
   vp_state_create_marker(afl, "vp_only", vp_entry_basename(q));
 
@@ -102,6 +103,9 @@ void vp_restore_queue_entry_state(afl_state_t *afl, struct queue_entry *q,
 
   if (was_vp_only || was_disabled) {
 
+    /* On a fastresume the blob is authoritative for vp_only and the restore
+       loop does the counting, exactly as for disabled entries below. */
+    if (!q->vp_only && !afl->fast_resume) { ++afl->vp_only_items; }
     q->vp_only = 1;
     vp_state_create_marker(afl, "vp_only", case_name);
 
@@ -123,7 +127,7 @@ void vp_restore_queue_entry_state(afl_state_t *afl, struct queue_entry *q,
 /* Prepare per-execution runtime VP state before running the main target. */
 void vp_prepare_exec(afl_state_t *afl, afl_forkserver_t *fsrv) {
 
-  if (!afl->value_profile_mode) return;
+  if (likely(!afl->value_profile_mode)) return;
   if (fsrv != &afl->fsrv) return;
 
   if (unlikely(!fsrv->use_value_profile)) {
@@ -148,9 +152,60 @@ void vp_prepare_exec(afl_state_t *afl, afl_forkserver_t *fsrv) {
       (afl->value_profile_active && !afl->value_profile_suppressed) ? 1U : 0U;
   if (!vp->enabled) return;
 
+  if (unlikely(!afl->vp_focus_active && afl->vp_sites_assigned &&
+               vp->control_len > VP_FOCUS_TARGET_SITES)) {
+
+    afl->vp_focus_rebuild_pending = 1;
+
+  }
+
   ++vp->exec_id;
   if (unlikely(!vp->exec_id)) { ++vp->exec_id; }
   vp->control_len = 0;
+
+}
+
+static inline u8 vp_bitmap_test(const u64 *bitmap, u32 site) {
+
+  return (u8)((bitmap[site >> 6] >> (site & 63)) & 1ULL);
+
+}
+
+static inline void vp_bitmap_set(u64 *bitmap, u32 site) {
+
+  bitmap[site >> 6] |= (1ULL << (site & 63));
+
+}
+
+#define VP_FOCUS_BITMAP_BYTES (sizeof(u64) * (VP_MAP_W / 64U))
+
+void vp_focus_init(afl_state_t *afl) {
+
+  if (!afl || afl->vp_focus_bitmap) return;
+
+  afl->vp_focus_bitmap = ck_alloc(VP_FOCUS_BITMAP_BYTES);
+  afl->vp_focus_prev = ck_alloc(VP_FOCUS_BITMAP_BYTES);
+  afl->vp_focus_relevant = ck_alloc(VP_FOCUS_BITMAP_BYTES);
+  afl->vp_site_idle = ck_alloc(sizeof(u16) * VP_MAP_W);
+  afl->vp_site_owned = ck_alloc(sizeof(u8) * VP_MAP_W);
+
+}
+
+static void vp_focus_push(afl_state_t *afl) {
+
+  vp_map_t *vp = afl ? afl->shm.vp_map : NULL;
+  if (unlikely(!vp)) return;
+
+  if (!afl->vp_focus_active || !afl->vp_focus_bitmap) {
+
+    vp->filter_mode = VP_FILTER_OFF;
+    memset(vp->filter_bitmap, 0, sizeof(vp->filter_bitmap));
+    return;
+
+  }
+
+  memcpy(vp->filter_bitmap, afl->vp_focus_bitmap, sizeof(vp->filter_bitmap));
+  vp->filter_mode = VP_FILTER_FOCUS;
 
 }
 
@@ -168,17 +223,13 @@ void vp_runtime_set_site_filter(afl_state_t *afl, const u16 *site_ids,
 
   }
 
-  vp->filter_enabled = site_cnt ? 1U : 0U;
+  vp->filter_mode = site_cnt ? VP_FILTER_STRICT : VP_FILTER_OFF;
 
 }
 
 void vp_runtime_clear_site_filter(afl_state_t *afl) {
 
-  vp_map_t *vp = afl ? afl->shm.vp_map : NULL;
-  if (unlikely(!vp)) return;
-
-  vp->filter_enabled = 0;
-  memset(vp->filter_bitmap, 0, sizeof(vp->filter_bitmap));
+  vp_focus_push(afl);
 
 }
 
@@ -197,6 +248,7 @@ u8 vp_runtime_observe_begin(afl_state_t *afl, const u16 *site_ids, u32 site_cnt,
     vp->site[site_id].hit_count = 0;
     vp->site[site_id].touched_mask = 0;
     vp->site[site_id].exec_seen = 0;
+    vp->site[site_id].flags &= ~(u32)VP_SITE_RETIRED;
 
   }
 
@@ -302,6 +354,7 @@ static inline u8 vp_is_better(u32 cand_dist, u64 cand_cost,
 
   if (old_entry->dist >= VP_DIST_UNSOLVED) return 1;
   if (cand_dist < old_entry->dist) return 1;
+  if (!old_entry->owner) return 0;
   if (cand_dist == old_entry->dist &&
       cand_cost < vp_entry_cost(old_entry->owner))
     return 1;
@@ -465,11 +518,24 @@ typedef struct {
 
 } vp_runtime_candidate_iter_t;
 
-/* Frontier slot validity check shared by scan paths. */
+/* Frontier slot validity check shared by scan paths. A solved slot stays
+   closed without an owner. */
 static inline u8 vp_frontier_slot_is_empty(const struct queue_entry *owner,
                                            u32                       dist) {
 
-  return !owner || owner->disabled || dist >= VP_DIST_UNSOLVED;
+  if (dist >= VP_DIST_UNSOLVED) return 1;
+  if (!dist) return 0;
+  return !owner || owner->disabled;
+
+}
+
+static inline void vp_release_solved_slot(afl_state_t *afl, size_t idx) {
+
+  vp_frontier_entry_t *entry = &afl->vp_frontier[idx];
+  if (entry->dist || !entry->owner) return;
+
+  vp_dec_ref(afl, entry->owner);
+  entry->owner = NULL;
 
 }
 
@@ -528,7 +594,11 @@ void vp_mark_favored_queue_entry(afl_state_t *afl, struct queue_entry *q) {
 
 /* Queue admission for VP-only inputs is intentionally strict-distance-only.
    Equal-distance cost improvements are not admitted on VP alone; they only
-   matter once a seed is already being applied to the frontier. */
+   matter once a seed is already being applied to the frontier. A solved
+   distance (0) on a slot no queue entry owns yet also does not admit: the
+   constraint is already satisfied and there is no gradient left to follow,
+   so admitting on that signal alone would teach the frontier nothing an
+   existing owner cannot already represent. */
 static inline u8 vp_frontier_runtime_slot_would_improve(afl_state_t *afl,
                                                         u32 site, u16 slot_rel,
                                                         u32 dist) {
@@ -537,7 +607,7 @@ static inline u8 vp_frontier_runtime_slot_would_improve(afl_state_t *afl,
 
   size_t               idx = vp_runtime_slot_base(site, slot_rel);
   vp_frontier_entry_t *entry = &afl->vp_frontier[idx];
-  if (vp_frontier_slot_is_empty(entry->owner, entry->dist)) return 1;
+  if (vp_frontier_slot_is_empty(entry->owner, entry->dist)) return dist != 0;
 
   return dist < entry->dist;
 
@@ -599,7 +669,16 @@ static inline void vp_frontier_site_clear_stale(afl_state_t *afl, u32 site) {
 
     size_t              idx = base + rel;
     struct queue_entry *owner = afl->vp_frontier[idx].owner;
-    if (owner && owner->disabled) { vp_clear_slot(afl, idx); }
+    if (!owner || !owner->disabled) continue;
+    if (!afl->vp_frontier[idx].dist) {
+
+      vp_release_solved_slot(afl, idx);
+
+    } else {
+
+      vp_clear_slot(afl, idx);
+
+    }
 
   }
 
@@ -624,7 +703,167 @@ static inline u8 vp_apply_runtime_site(afl_state_t *afl, struct queue_entry *q,
 
   } while (vp_runtime_candidate_iter_next(&it, &slot_rel, &dist));
 
+  if (site_changed && afl->vp_site_idle) { afl->vp_site_idle[site] = 0; }
+
   return site_changed;
+
+}
+
+static inline void vp_site_frontier_state(afl_state_t *afl, u32 site,
+                                          u8 *owned_cnt, u8 *has_unresolved) {
+
+  size_t base = vp_site_base(site);
+  u8     owned = 0;
+
+  *has_unresolved = 0;
+
+  for (size_t rel = 0; rel < VP_SLOTS; ++rel) {
+
+    const vp_frontier_entry_t *entry = &afl->vp_frontier[base + rel];
+    if (vp_frontier_slot_is_empty(entry->owner, entry->dist)) continue;
+
+    ++owned;
+    if (entry->dist) { *has_unresolved = 1; }
+
+  }
+
+  *owned_cnt = owned;
+
+}
+
+static u32 vp_focus_fill(afl_state_t *afl, vp_map_t *vp, const u64 *tier,
+                         u8 want_member, u32 cursor, u32 limit, u32 *live) {
+
+  u32 taken = 0;
+  u32 scanned = 0;
+  u32 pos = cursor < VP_MAP_W ? cursor : 0;
+  u32 next = pos;
+
+  while (scanned < VP_MAP_W && taken < limit) {
+
+    u32 s = pos;
+    ++scanned;
+    pos = s + 1 < VP_MAP_W ? s + 1 : 0;
+
+    if (!vp->site_ids[s]) continue;
+    if (vp->site[s].flags & VP_SITE_RETIRED) continue;
+    if (vp_bitmap_test(tier, s) != want_member) continue;
+    if (vp_bitmap_test(afl->vp_focus_bitmap, s)) continue;
+
+    vp_bitmap_set(afl->vp_focus_bitmap, s);
+    ++taken;
+    next = pos;
+
+  }
+
+  *live += taken;
+  return next;
+
+}
+
+void vp_focus_rotate(afl_state_t *afl) {
+
+  if (!afl || !afl->value_profile_active || !afl->vp_frontier) return;
+
+  vp_map_t *vp = afl->shm.vp_map;
+  if (unlikely(!vp || !afl->vp_focus_bitmap || !afl->vp_site_idle ||
+               !afl->vp_site_owned))
+    return;
+
+  afl->vp_focus_rebuild_pending = 0;
+
+  u64 *focus = afl->vp_focus_bitmap;
+  u64 *prev = afl->vp_focus_prev;
+  u64 *relevant = afl->vp_focus_relevant;
+
+  memcpy(prev, focus, VP_FOCUS_BITMAP_BYTES);
+  memset(focus, 0, VP_FOCUS_BITMAP_BYTES);
+  memset(relevant, 0, VP_FOCUS_BITMAP_BYTES);
+
+  u32 assigned = 0, retired = 0;
+
+  for (u32 s = 0; s < VP_MAP_W; ++s) {
+
+    if (!vp->site_ids[s]) continue;
+    ++assigned;
+
+    vp_site_t *site = &vp->site[s];
+    u32        flags = site->flags;
+    u8         was_retired = (u8)((flags & VP_SITE_RETIRED) != 0);
+    u8         was_recording = (u8)(!was_retired &&
+                            (!afl->vp_focus_active || vp_bitmap_test(prev, s)));
+
+    for (size_t rel = 0; rel < VP_SLOTS; ++rel) {
+
+      vp_release_solved_slot(afl, vp_site_base(s) + rel);
+
+    }
+
+    u8 owned_cnt, has_unresolved;
+    vp_site_frontier_state(afl, s, &owned_cnt, &has_unresolved);
+
+    if (owned_cnt != afl->vp_site_owned[s]) {
+
+      afl->vp_site_owned[s] = owned_cnt;
+      afl->vp_site_idle[s] = 0;
+
+    } else if (was_recording && afl->vp_site_idle[s] < 0xFFFFU) {
+
+      ++afl->vp_site_idle[s];
+
+    }
+
+    u8 retire = (u8)((owned_cnt == VP_SLOTS && !has_unresolved) ||
+                     (!has_unresolved &&
+                      afl->vp_site_idle[s] >= VP_IDLE_RETIRE_CYCLES));
+
+    site->flags =
+        retire ? (flags | VP_SITE_RETIRED) : (flags & ~(u32)VP_SITE_RETIRED);
+
+    if (retire) {
+
+      ++retired;
+      continue;
+
+    }
+
+    if (has_unresolved) { vp_bitmap_set(relevant, s); }
+
+  }
+
+  afl->vp_sites_assigned = assigned;
+  afl->vp_sites_retired = retired;
+
+  if (assigned <= VP_FOCUS_TARGET_SITES) {
+
+    afl->vp_focus_active = 0;
+    afl->vp_focus_live = assigned - retired;
+    vp_focus_push(afl);
+    return;
+
+  }
+
+  u32 live = 0;
+  u32 owner_cap = VP_FOCUS_TARGET_SITES - (VP_FOCUS_TARGET_SITES / 4U);
+
+  afl->vp_focus_cursor = vp_focus_fill(afl, vp, relevant, 1,
+                                       afl->vp_focus_cursor, owner_cap, &live);
+
+  afl->vp_focus_sample_cursor =
+      vp_focus_fill(afl, vp, relevant, 0, afl->vp_focus_sample_cursor,
+                    VP_FOCUS_TARGET_SITES - live, &live);
+
+  if (live < VP_FOCUS_TARGET_SITES) {
+
+    afl->vp_focus_cursor =
+        vp_focus_fill(afl, vp, relevant, 1, afl->vp_focus_cursor,
+                      VP_FOCUS_TARGET_SITES - live, &live);
+
+  }
+
+  afl->vp_focus_live = live;
+  afl->vp_focus_active = 1;
+  vp_focus_push(afl);
 
 }
 
@@ -679,24 +918,10 @@ static inline void vp_trim_guard_add_site(vp_trim_guard_t *guard, u32 site) {
 }
 
 static inline void vp_trim_guard_add_req(vp_trim_guard_t *guard, u32 site,
-                                         u32 site_req_start, u16 slot_rel,
-                                         u32 max_dist) {
+                                         u16 slot_rel, u32 max_dist) {
 
-  /* Only deduplicate against requests already emitted for this same site.
-     Different sites may have identical relative slots and distances but must
-     remain independent preservation requirements. */
-  for (u32 i = site_req_start; i < guard->req_cnt; ++i) {
-
-    vp_trim_req_t *r = &guard->req[i];
-    if (r->slot_rel == slot_rel && r->max_dist == max_dist) {
-
-      if (r->need < 0xffffU) { ++r->need; }
-      return;
-
-    }
-
-  }
-
+  /* The caller visits each (site, rel) pair at most once, so every request
+     added here is independent; need is always 1. */
   if (guard->req_cnt == guard->req_cap) {
 
     u32 new_cap = guard->req_cap ? guard->req_cap << 1 : 8;
@@ -808,7 +1033,6 @@ vp_trim_guard_t *vp_trim_guard_init(afl_state_t *afl, struct queue_entry *q) {
 
     size_t base = vp_site_base(site);
     u8     site_added = 0;
-    u32    site_req_start = guard->req_cnt;
     for (u16 rel = 0; rel < VP_SLOTS && refs_left; ++rel) {
 
       vp_frontier_entry_t *entry = &afl->vp_frontier[base + rel];
@@ -821,7 +1045,7 @@ vp_trim_guard_t *vp_trim_guard_init(afl_state_t *afl, struct queue_entry *q) {
 
       }
 
-      vp_trim_guard_add_req(guard, site, site_req_start, rel, entry->dist);
+      vp_trim_guard_add_req(guard, site, rel, entry->dist);
       --refs_left;
 
     }
@@ -1054,6 +1278,43 @@ static void vp_clear_transient_state(afl_state_t *afl) {
 
   afl->vp_delayed_evictions_pending = 0;
 
+  if (afl->vp_focus_bitmap) {
+
+    memset(afl->vp_focus_bitmap, 0, VP_FOCUS_BITMAP_BYTES);
+    memset(afl->vp_focus_prev, 0, VP_FOCUS_BITMAP_BYTES);
+    memset(afl->vp_focus_relevant, 0, VP_FOCUS_BITMAP_BYTES);
+
+  }
+
+  if (afl->vp_site_idle) {
+
+    memset(afl->vp_site_idle, 0, sizeof(u16) * VP_MAP_W);
+    memset(afl->vp_site_owned, 0, sizeof(u8) * VP_MAP_W);
+
+  }
+
+  afl->vp_focus_rebuild_pending = 0;
+  afl->vp_focus_cursor = 0;
+  afl->vp_focus_sample_cursor = 0;
+  afl->vp_focus_live = 0;
+  afl->vp_sites_assigned = 0;
+  afl->vp_sites_retired = 0;
+  afl->vp_focus_active = 0;
+
+  vp_map_t *vp = afl->shm.vp_map;
+  if (vp) {
+
+    for (u32 s = 0; s < VP_MAP_W; ++s) {
+
+      vp->site[s].flags &= ~(u32)VP_SITE_RETIRED;
+
+    }
+
+    vp->filter_mode = VP_FILTER_OFF;
+    memset(vp->filter_bitmap, 0, sizeof(vp->filter_bitmap));
+
+  }
+
 }
 
 /* Replay queue entries once VP activates in stagnation mode so the frontier
@@ -1073,9 +1334,8 @@ static void vp_replay_queue(afl_state_t *afl) {
 
   }
 
-  ACTF("Value profile replaying %u queued entries.", end - start);
-
   u32 i = start;
+  u32 replayed = 0;
   for (; i < end; ++i) {
 
     if (afl->stop_soon) break;
@@ -1086,9 +1346,11 @@ static void vp_replay_queue(afl_state_t *afl) {
     u8 *mem = queue_testcase_get(afl, q);
     if (!vp_collect_signal_for_input(afl, mem, q->len)) continue;
     vp_frontier_apply(afl, q);
+    ++replayed;
 
   }
 
+  ACTF("Value profile replayed %u queued entries.", replayed);
   afl->value_profile_replay_idx = i;
 
 }
@@ -1110,7 +1372,7 @@ void vp_restore_resume_state(afl_state_t *afl) {
 
   if (!afl->value_profile_mode) return;
 
-  if (afl->value_profile_mode == 2 && !afl->value_profile_active) {
+  if (afl->value_profile_mode > 1 && !afl->value_profile_active) {
 
     if (!afl->vp_start_time) return;
     afl->value_profile_active = 1;
@@ -1121,13 +1383,14 @@ void vp_restore_resume_state(afl_state_t *afl) {
 
   afl->value_profile_replay_idx = 0;
   vp_replay_queue(afl);
+  vp_focus_rotate(afl);
   afl->score_changed = 1;
 
 }
 
 void vp_update_activation(afl_state_t *afl) {
 
-  if (afl->value_profile_mode != 2) return;
+  if (unlikely(afl->value_profile_mode != 2)) return;
 
   u64 cur = get_cur_time();
   /* Stagnation mode is edge-coverage based, not queue-growth based. */
@@ -1139,14 +1402,44 @@ void vp_update_activation(afl_state_t *afl) {
 
   if (should && !afl->value_profile_active) {
 
+    if (afl->afl_env.afl_no_ui) {
+
+      OKF("Stagnation (%llu s), enabling value profiling.",
+          (unsigned long long)(no_find_ms / 1000));
+
+    }
+
     afl->value_profile_active = 1;
     vp_note_activation(afl, cur);
     vp_clear_transient_state(afl);
     afl->value_profile_replay_idx = 0;
     vp_replay_queue(afl);
+    vp_focus_rotate(afl);
     afl->score_changed = 1;
-    OKF("Stagnation (%llu s), enabling value profiling.",
-        (unsigned long long)(no_find_ms / 1000));
+
+  }
+
+}
+
+void vp_force_activation(afl_state_t *afl) {
+
+  if (unlikely(!afl || !afl->value_profile_mode)) return;
+
+  if (likely(!afl->value_profile_active)) {
+
+    if (afl->afl_env.afl_no_ui) {
+
+      OKF("Starvation, enabling value profiling.");
+
+    }
+
+    afl->value_profile_active = 1;
+    vp_note_activation(afl, get_cur_time());
+    vp_clear_transient_state(afl);
+    afl->value_profile_replay_idx = 0;
+    vp_replay_queue(afl);
+    vp_focus_rotate(afl);
+    afl->score_changed = 1;
 
   }
 

@@ -32,6 +32,7 @@
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/MDBuilder.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Demangle/Demangle.h"
@@ -818,6 +819,16 @@ unsigned long long int calculateCollisions(uint32_t edges) {
 
 }
 
+bool isAflCovFusedEnabled(void) {
+
+  static int enabled = -1;
+
+  if (enabled < 0) { enabled = getenv("AFL_LLVM_FUSED") != NULL; }
+
+  return enabled != 0;
+
+}
+
 bool isDecisionUse(const Value *Cond) {
 
   SmallVector<const Value *, 8> Worklist;
@@ -860,7 +871,11 @@ bool isDecisionUse(const Value *Cond) {
 
       } else if (const auto *BO = dyn_cast<BinaryOperator>(U)) {
 
-        if (BO->getType()->isIntegerTy(1)) Worklist.push_back(BO);
+        if (BO->getType()->isIntegerTy(1) &&
+            (!isAflCovFusedEnabled() || (BO->getOpcode() == Instruction::Xor &&
+                                         (isa<Constant>(BO->getOperand(0)) ||
+                                          isa<Constant>(BO->getOperand(1))))))
+          Worklist.push_back(BO);
 
       } else if (const auto *PN = dyn_cast<PHINode>(U)) {
 
@@ -886,7 +901,63 @@ bool isDecisionUse(const Value *Cond) {
 
 }
 
+/* Clamps and min/max are opt-in: they add ~10% map entries, but 45% of the
+   sites land in per-pixel math, where they measured -21% throughput on libraw
+   while contributing the least discriminating signal. The parser side sites
+   are the valuable ones, so enable this per target after measuring. */
+bool isAflCovMinMaxEnabled(void) {
+
+  static int enabled = -1;
+
+  if (enabled < 0) { enabled = getenv("AFL_LLVM_MINMAX") != NULL; }
+
+  return enabled != 0;
+
+}
+
+bool isAflCovMinMaxIntrinsic(Instruction &I) {
+
+  if (!isAflCovMinMaxEnabled()) return false;
+
+  const auto *II = dyn_cast<IntrinsicInst>(&I);
+  if (!II) return false;
+
+  switch (II->getIntrinsicID()) {
+
+    case Intrinsic::smin:
+    case Intrinsic::smax:
+    case Intrinsic::umin:
+    case Intrinsic::umax:
+    case Intrinsic::abs:
+    case Intrinsic::minnum:
+    case Intrinsic::maxnum:
+    case Intrinsic::minimum:
+    case Intrinsic::maximum:
+      return true;
+
+    default:
+      return false;
+
+  }
+
+}
+
+/* Per-lane instrumentation of vector decisions is opt-in: a vector compare in
+   an auto-vectorized pixel loop costs two guards per lane and is nearly always
+   true, so it is the least discriminating signal we can add. */
+bool isAflCovVectorEnabled(void) {
+
+  static int enabled = -1;
+
+  if (enabled < 0) { enabled = getenv("AFL_LLVM_VECTORS") != NULL; }
+
+  return enabled != 0;
+
+}
+
 bool isAflCovInterestingInstruction(Instruction &I) {
+
+  if (I.getMetadata("afl.skip")) return false;
 
   switch (I.getOpcode()) {
 
@@ -914,6 +985,13 @@ bool isAflCovInterestingInstruction(Instruction &I) {
 
       if (t->getTypeID() == llvm::Type::IntegerTyID) return true;
 
+      if (t->getTypeID() == llvm::Type::FixedVectorTyID ||
+          t->getTypeID() == llvm::Type::ScalableVectorTyID) {
+
+        return isAflCovVectorEnabled();
+
+      }
+
       return false;
 
     }
@@ -932,6 +1010,9 @@ bool isAflCovInterestingInstruction(Instruction &I) {
              Op == AtomicRMWInst::UMin || Op == AtomicRMWInst::UMax;
 
     }
+
+    case Instruction::Call:
+      return isAflCovMinMaxIntrinsic(I);
 
     default:
       return false;

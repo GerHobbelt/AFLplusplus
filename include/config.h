@@ -481,6 +481,13 @@ We add 4 byte for one u32 length field. */
 
 #define CAL_CHANCES 3
 
+/* Upper bound on how many queue entries may be skipped in a row before the
+   queue driver returns to the main loop. Skipping is normal, but the main
+   loop is where the -V / -E limits, cull_queue() and the alias table live,
+   so it must always be reachable: */
+
+#define QUEUE_SKIP_STREAK_MAX 1024
+
 /* How often the coverage of an entry that failed calibration is handed back
    to virgin_bits, counted per map byte. A path that can never be calibrated
    would otherwise be rediscovered and requeued without bound, so beyond this
@@ -559,6 +566,12 @@ We add 4 byte for one u32 length field. */
 
 #define CMPLOG_SHM_ENV_VAR "__AFL_CMPLOG_SHM_ID"
 #define VP_SHM_ENV_VAR "__AFL_VP_SHM_ID"
+
+#define VP_FOCUS_TARGET_SITES 4096U
+
+#define VP_IDLE_RETIRE_CYCLES 4U
+
+#define VP_FRONTIER_WEIGHT_MULT 16.0
 
 /* ASAN SHM ID */
 #define AFL_ASAN_FUZZ_SHM_ENV_VAR "__AFL_ASAN_SHM_ID"

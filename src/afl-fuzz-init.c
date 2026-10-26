@@ -32,6 +32,8 @@
 #include <sys/stat.h>
 #include "cmplog.h"
 
+static afl_state_t *local_afl;
+
 #ifdef HAVE_AFFINITY
 
   #if !defined(__APPLE__)
@@ -764,16 +766,23 @@ void read_foreign_testcases(afl_state_t *afl, int first) {
 
       if (!fdir) {
 
-        if (first) {
+        /* read_foreign_testcases() is only ever called with first == 0 (the
+           first == 1 call site is disabled), so gating this on first hid a
+           mistyped -F path forever. Report it once per directory instead. */
+        if (first || !afl->foreign_syncs[iter].warned) {
 
-          WARNF("Unable to open directory '%s'", afl->foreign_syncs[iter].dir);
-          sleep(1);
+          afl->foreign_syncs[iter].warned = 1;
+          WARNF("Unable to open -F directory '%s'",
+                afl->foreign_syncs[iter].dir);
+          if (first) { sleep(1); }
 
         }
 
         continue;
 
       }
+
+      afl->foreign_syncs[iter].warned = 0;
 
       /* Show stats */
 
@@ -791,12 +800,17 @@ void read_foreign_testcases(afl_state_t *afl, int first) {
 
         struct stat st;
 
-        if (fn->d_type != DT_REG && fn->d_type != DT_UNKNOWN) { continue; }
+        if (fn->d_type != DT_REG && fn->d_type != DT_UNKNOWN &&
+            fn->d_type != DT_LNK) {
+
+          continue;
+
+        }
 
         u8 *fn2 =
             alloc_printf("%s/%s", afl->foreign_syncs[iter].dir, fn->d_name);
 
-        if (unlikely(lstat(fn2, &st) || (first && access(fn2, R_OK)))) {
+        if (unlikely(stat(fn2, &st) || (first && access(fn2, R_OK)))) {
 
           if (first) PFATAL("Unable to access '%s'", fn2);
           ck_free(fn2);
@@ -860,7 +874,16 @@ void read_foreign_testcases(afl_state_t *afl, int first) {
         fault = fuzz_run_target(afl, &afl->fsrv, afl->fsrv.exec_tmout);
         afl->syncing_party = foreign_name;
         afl->foreign_file = fn->d_name;
+        u32 was_imported = afl->queued_imported;
         afl->queued_imported += save_if_interesting(afl, mem, len, fault);
+        if (afl->queued_imported > was_imported &&
+            !afl->foreign_syncs[iter].announced) {
+
+          afl->foreign_syncs[iter].announced = 1;
+          OKF("Foreign sync '%s' is live: first import from '%s'", foreign_name,
+              afl->foreign_syncs[iter].dir);
+
+        }
 
         munmap(orig_mem, st.st_size);
         close(fd);
@@ -895,18 +918,57 @@ void read_foreign_testcases(afl_state_t *afl, int first) {
 
 }
 
+static struct {
+
+  dev_t dev;
+  ino_t ino;
+
+} *seen_dirs;
+
+static u32 seen_dirs_cnt, seen_dirs_cap;
+
+static u8 dir_already_seen(u8 *dir) {
+
+  struct stat st;
+  if (stat((char *)dir, &st)) { return 0; }
+
+  for (u32 i = 0; i < seen_dirs_cnt; i++) {
+
+    if (seen_dirs[i].dev == st.st_dev && seen_dirs[i].ino == st.st_ino) {
+
+      return 1;
+
+    }
+
+  }
+
+  if (seen_dirs_cnt >= seen_dirs_cap) {
+
+    seen_dirs_cap = seen_dirs_cap ? seen_dirs_cap * 2 : 64;
+    seen_dirs = ck_realloc(seen_dirs, seen_dirs_cap * sizeof(*seen_dirs));
+
+  }
+
+  seen_dirs[seen_dirs_cnt].dev = st.st_dev;
+  seen_dirs[seen_dirs_cnt].ino = st.st_ino;
+  seen_dirs_cnt++;
+  return 0;
+
+}
+
 /* Read all testcases from the input directory, then queue them for testing.
+   Symlinks are followed, cycles are caught by dir_already_seen().
    Called at startup. */
 
 void read_testcases(afl_state_t *afl, u8 *directory) {
 
-  struct dirent **nl;
+  struct dirent **nl = NULL;
   s32             nl_cnt, subdirs = 1;
   u32             i;
   u8             *fn1, *dir = directory;
   u8              val_buf[2][STRINGIFY_VAL_SIZE_MAX];
 
-  /* Auto-detect non-in-place resumption attempts. */
+  // Auto-detect non-in-place resumption attempts.
 
   if (dir == NULL) {
 
@@ -925,6 +987,8 @@ void read_testcases(afl_state_t *afl, u8 *directory) {
     dir = afl->in_dir;
 
   }
+
+  if (dir_already_seen(dir)) { return; }
 
   ACTF("Scanning '%s'...", dir);
 
@@ -960,7 +1024,7 @@ void read_testcases(afl_state_t *afl, u8 *directory) {
 
   }
 
-  if (nl_cnt) {
+  if (nl_cnt > 0) {
 
     u32 done = 0;
     i = 0;
@@ -979,7 +1043,7 @@ void read_testcases(afl_state_t *afl, u8 *directory) {
       u8 passed_det = 0;
       u8 var_behavior = 0;
 
-      if (lstat(fn2, &st) || access(fn2, R_OK)) {
+      if (stat(fn2, &st) || access(fn2, R_OK)) {
 
         PFATAL("Unable to access '%s'", fn2);
 
@@ -987,7 +1051,8 @@ void read_testcases(afl_state_t *afl, u8 *directory) {
 
       /* obviously we want to skip "descending" into . and .. directories,
          however it is a good idea to skip also directories that start with
-         a dot */
+         a dot. symlinked directories are descended into as well, the cycle
+         check in read_testcases() stops loops */
       if (subdirs && S_ISDIR(st.st_mode) && case_name[0] != '.') {
 
         free(nl[i]);                                         /* not tracked */
@@ -1761,11 +1826,21 @@ void perform_dry_run(afl_state_t *afl) {
 
 }
 
-/* Helper function: link() if possible, copy otherwise. */
+/* Helper function: link() if possible, copy otherwise. Symlinks are always
+   copied, a hard link would only duplicate the link itself and its relative
+   target would not resolve from the new location. */
 
 static void link_or_copy(u8 *old_path, u8 *new_path, mode_t perm) {
 
-  s32 i = link(old_path, new_path);
+  struct stat st;
+  s32         i = -1;
+
+  if (lstat(old_path, &st) || !S_ISLNK(st.st_mode)) {
+
+    i = link(old_path, new_path);
+
+  }
+
   if (!i) { return; }
 
   s32 sfd, dfd;
@@ -1923,7 +1998,7 @@ void pivot_inputs(afl_state_t *afl) {
     /* Make sure that the passed_det value carries over, too. */
 
     if (q->passed_det) { mark_as_det_done(afl, q); }
-    if (q->var_behavior) { mark_as_variable(afl, q); }
+    if (q->var_behavior) { mark_as_variable(afl, q, 1); }
 
     if (afl->custom_mutators_count) {
 
@@ -3294,13 +3369,16 @@ void fix_up_sync(afl_state_t *afl) {
 static void handle_resize(int sig) {
 
   (void)sig;
-  afl_states_clear_screen();
+  if (local_afl) { local_afl->clear_screen = 1; }
 
 }
 
 /* Check ASAN options. */
 
 void check_asan_opts(afl_state_t *afl) {
+
+  // This is always called before fuzzing, so let's plug it in here:
+  local_afl = afl;
 
   u8 *x = get_afl_env("ASAN_OPTIONS");
 
@@ -3363,7 +3441,22 @@ void check_asan_opts(afl_state_t *afl) {
 static void handle_stop_sig(int sig) {
 
   (void)sig;
-  afl_states_stop();
+  if (local_afl) {
+
+    local_afl->stop_soon = 1;
+
+    if (local_afl->fsrv.child_pid > 0)
+      kill(local_afl->fsrv.child_pid, local_afl->fsrv.child_kill_signal);
+    if (local_afl->fsrv.fsrv_pid > 0) {
+
+      kill(local_afl->fsrv.fsrv_pid, local_afl->fsrv.fsrv_kill_signal);
+      usleep(100);
+      // Make sure the forkserver does not end up as zombie.
+      waitpid(local_afl->fsrv.fsrv_pid, NULL, WNOHANG);
+
+    }
+
+  }
 
 }
 
@@ -3372,7 +3465,16 @@ static void handle_stop_sig(int sig) {
 static void handle_skipreq(int sig) {
 
   (void)sig;
-  afl_states_request_skip();
+  if (local_afl) { local_afl->skip_requested = 1; }
+
+}
+
+/* Handle sync request (SIGUSR2). */
+
+static void handle_syncreq(int sig) {
+
+  (void)sig;
+  if (local_afl) { local_afl->sync_requested = 1; }
 
 }
 
@@ -3804,6 +3906,11 @@ void setup_signal_handlers(void) {
 
   sa.sa_handler = handle_skipreq;
   sigaction(SIGUSR1, &sa, NULL);
+
+  /* SIGUSR2: force a sync */
+
+  sa.sa_handler = handle_syncreq;
+  sigaction(SIGUSR2, &sa, NULL);
 
   /* Things we don't care about. */
 

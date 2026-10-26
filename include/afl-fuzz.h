@@ -293,8 +293,8 @@ struct queue_entry {
       fs_redundant,                     /* Marked as redundant in the fs?   */
       is_ascii,                         /* Is the input just ascii text?    */
       disabled,                         /* Is disabled from fuzz selection  */
-      tightness_novel;  /* New per-site min-slack on any
-                           inequality cmp; keep favoured.   */
+      cache_wanted,                     /* Wanted in the testcase cache?    */
+      tightness_novel;          /* min-slack on inequality cmp; keep fav'ed */
 
   u32 bitmap_size,                      /* Number of bits set in bitmap     */
 #ifdef INTROSPECTION
@@ -638,6 +638,8 @@ struct foreign_sync {
 
   u8    *dir;
   time_t mtime;
+  u8     warned;              /* unopenable dir already reported            */
+  u8     announced;          /* first successful import already reported    */
 
 };
 
@@ -753,6 +755,8 @@ typedef struct afl_state {
   u8 *virgin_reclaim;                  /* handbacks per byte, see rollback  */
   u8  virgin_undo_armed;                /* a discovery may still be undone  */
   u8  virgin_undo_valid;               /* virgin_undo holds a usable copy   */
+  // u8  primary_trace;                   /* trace_bits holds the coverage map
+  // */
 
   double *alias_probability;            /* alias weighted probabilities     */
   u32    *alias_table;                /* alias weighted random lookup table */
@@ -763,6 +767,7 @@ typedef struct afl_state {
   u32     splice_buf_alloc;           /* allocated capacity of splice_buf   */
   u32     active_items;                 /* enabled entries in the queue     */
   u32     disabled_items;               /* disabled entries in the queue    */
+  u32     vp_only_items;                /* queue entries added by VP only   */
 
   long double coe_fuzz_mu;              /* COE mean log2(n_fuzz) of queue   */
 
@@ -775,7 +780,8 @@ typedef struct afl_state {
   size_t san_dedup_entries;
 
   volatile u8 stop_soon,                /* Ctrl-C pressed?                  */
-      clear_screen;                     /* Window resized?                  */
+      clear_screen,                     /* Window resized?                  */
+      sync_requested;                   /* Sync request, via SIGUSR2        */
 
   u32 queued_items,                     /* Total number of queued testcases */
       queued_variable,                  /* Testcases with variable behavior */
@@ -931,7 +937,7 @@ typedef struct afl_state {
   struct cmp_map_snapshot *orig_cmp_map;
 
   /* Value profiling */
-  u8  value_profile_mode;              /* 0=off, 1=always, 2=stagnation     */
+  u8  value_profile_mode;                /* 0=off,1=always,2=stagn,3=starve */
   u32 value_profile_stagnation_secs;   /* Stagnation threshold (seconds)    */
   u8  value_profile_active;            /* Currently active?                 */
   u8  value_profile_suppressed;        /* Temporarily skip runtime collect  */
@@ -940,7 +946,19 @@ typedef struct afl_state {
   u32 value_profile_replay_idx;        /* Next queue index to replay when   */
                                      /* stagnation mode first activates VP */
   vp_frontier_entry_t *vp_frontier;    /* Frontier slots                    */
-  u8 vp_delayed_evictions_pending;     /* VP-only disables due next cycle   */
+  u8   vp_delayed_evictions_pending;   /* VP-only disables due next cycle   */
+  u64 *vp_focus_bitmap;
+  u64 *vp_focus_prev;
+  u64 *vp_focus_relevant;
+  u16 *vp_site_idle;
+  u8  *vp_site_owned;
+  u32  vp_focus_cursor;
+  u32  vp_focus_sample_cursor;
+  u32  vp_focus_live;
+  u32  vp_sites_assigned;
+  u32  vp_sites_retired;
+  u8   vp_focus_active;
+  u8   vp_focus_rebuild_pending;
 
   u8 describe_op_buf_256[256]; /* describe_op will use this to return a string
                                   up to 256 */
@@ -995,6 +1013,12 @@ typedef struct afl_state {
 
   u8 *out_scratch_buf;
 
+  u8 *trim_scratch_buf;
+
+  u8 *post_process_orig_buf;
+
+  u8 *post_process_orig_buf_scratch;
+
   u8 *eff_buf;
 
   u8 *in_buf;
@@ -1024,27 +1048,20 @@ typedef struct afl_state {
   /* This is the user specified maximum size to use for the testcase cache */
   u64 q_testcase_max_cache_size;
 
-  /* This is the user specified maximum entries in the testcase cache */
-  u32 q_testcase_max_cache_entries;
-
   /* How much of the testcase cache is used so far */
   u64 q_testcase_cache_size;
-
-  /* highest cache count so far */
-  u32 q_testcase_max_cache_count;
 
   /* How many queue entries currently have cached testcases */
   u32 q_testcase_cache_count;
 
-  /* the smallest id currently known free entry */
-  u32 q_testcase_smallest_free;
-
   /* How often did we evict from the cache (for statistics only) */
   u32 q_testcase_evictions;
 
-  /* Refs to each queue entry with cached testcase (for eviction, if cache_count
-   * is too large) */
-  struct queue_entry **q_testcase_cache;
+  /* Lowest density bucket whose entries belong in the testcase cache */
+  u32 cache_bucket_min;
+
+  /* Testcase cache hits and misses (for statistics only) */
+  u64 q_testcase_hits, q_testcase_misses;
 
   /* Global Profile Data for deterministic/havoc-splice stage */
   struct havoc_profile *havoc_prof;
@@ -1109,6 +1126,7 @@ struct custom_mutator {
   char       *name_short;
   void       *dh;
   u8         *post_process_buf;
+  u8         *post_process_buf_scratch;
   u8          stacked_custom_prob, stacked_custom;
 
   void *data;                                    /* custom mutator data ptr */
@@ -1369,13 +1387,6 @@ void afl_state_init(afl_state_t *, uint32_t map_size);
 void afl_state_deinit(afl_state_t *);
 void afl_resize_map_buffers(afl_state_t *, u32 old_size, u32 new_size);
 
-/* Set stop_soon flag on all children, kill all children */
-void afl_states_stop(void);
-/* Set clear_screen flag on all states */
-void afl_states_clear_screen(void);
-/* Sets the skip flag on all states */
-void afl_states_request_skip(void);
-
 /* Setup shmem for testcase delivery */
 void setup_testcase_shmem(afl_state_t *afl);
 
@@ -1387,7 +1398,8 @@ void read_afl_environment(afl_state_t *, char **);
 void setup_custom_mutators(afl_state_t *);
 void destroy_custom_mutators(afl_state_t *);
 u8   trim_case_custom(afl_state_t *, struct queue_entry *q, u8 *in_buf,
-                      struct custom_mutator *mutator, vp_trim_hooks_t *vp_hooks);
+                      struct custom_mutator *mutator, vp_trim_hooks_t *vp_hooks,
+                      u64 *trim_start_us);
 u8   run_afl_custom_queue_new_entry(afl_state_t *, struct queue_entry *, u8 *,
                                     u8 *);
 
@@ -1416,7 +1428,7 @@ void        deinit_py(void *);
 /* Queue */
 
 void mark_as_det_done(afl_state_t *, struct queue_entry *);
-void mark_as_variable(afl_state_t *, struct queue_entry *);
+void mark_as_variable(afl_state_t *, struct queue_entry *, u8);
 u8   add_to_queue(afl_state_t *, u8 *, u32, u8);
 void destroy_queue(afl_state_t *);
 void update_bitmap_score(afl_state_t *, struct queue_entry *, bool);
@@ -1465,6 +1477,7 @@ void afl_dump_module_map(afl_state_t *);
 void vp_note_activation(afl_state_t *, u64);
 void vp_restore_resume_state(afl_state_t *);
 void vp_update_activation(afl_state_t *);
+void vp_force_activation(afl_state_t *);
 void vp_frontier_apply(afl_state_t *, struct queue_entry *);
 u8   vp_frontier_would_improve(afl_state_t *);
 void vp_disable_unowned_entry(afl_state_t *, struct queue_entry *);
@@ -1482,6 +1495,8 @@ void vp_persist_disabled_marker(afl_state_t *, struct queue_entry *);
 void vp_restore_queue_entry_state(afl_state_t *, struct queue_entry *,
                                   const char *);
 void vp_prepare_exec(afl_state_t *, afl_forkserver_t *);
+void vp_focus_init(afl_state_t *);
+void vp_focus_rotate(afl_state_t *);
 void vp_runtime_set_site_filter(afl_state_t *, const u16 *, u32);
 void vp_runtime_clear_site_filter(afl_state_t *);
 u8   vp_runtime_observe_begin(afl_state_t *, const u16 *, u32, vp_site_t *);

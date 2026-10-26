@@ -35,11 +35,6 @@ char *power_names[POWER_SCHEDULES_NUM] = {"explore", "mmopt", "exploit",
                                           "fast",    "coe",   "lin",
                                           "quad",    "rare",  "seek"};
 
-/* A global pointer to all instances is needed (for now) for signals to arrive
- */
-
-static list_t afl_states = {.element_prealloc_count = 0};
-
 /* Initializes an afl_state_t. */
 
 void afl_state_init(afl_state_t *afl, uint32_t map_size) {
@@ -59,6 +54,8 @@ void afl_state_init(afl_state_t *afl, uint32_t map_size) {
   afl->schedule = EXPLORE;              /* Power schedule (default: EXPLORE)*/
   afl->havoc_max_mult = HAVOC_MAX_MULT;
   afl->clear_screen = 1;                /* Window resized?                  */
+  // afl->primary_trace = 1;              /* trace_bits holds the coverage map
+  // */
   afl->havoc_div = 1;                   /* Cycle count divisor for havoc    */
   afl->stage_name = "init";             /* Name of the current fuzz stage   */
   afl->splicing_with = -1;              /* Splicing with which test case?   */
@@ -76,7 +73,6 @@ void afl_state_init(afl_state_t *afl, uint32_t map_size) {
   afl->max_length = MAX_FILE;
   afl->switch_fuzz_mode = STRATEGY_SWITCH_TIME * 1000;
   afl->q_testcase_max_cache_size = TESTCASE_CACHE_SIZE * 1048576UL;
-  afl->q_testcase_max_cache_entries = 64 * 1024;
 
 #ifdef HAVE_AFFINITY
   afl->cpu_aff = -1;                    /* Selected CPU core                */
@@ -127,8 +123,6 @@ void afl_state_init(afl_state_t *afl, uint32_t map_size) {
 
   /* 10% FrameShift overhead default */
   afl->afl_env.afl_frameshift_max_overhead = 0.10;
-
-  list_append(&afl_states, afl);
 
 }
 
@@ -930,6 +924,9 @@ void afl_state_deinit(afl_state_t *afl) {
   afl_free(afl->queue_buf);
   afl_free(afl->out_buf);
   afl_free(afl->out_scratch_buf);
+  afl_free(afl->trim_scratch_buf);
+  afl_free(afl->post_process_orig_buf);
+  afl_free(afl->post_process_orig_buf_scratch);
   afl_free(afl->eff_buf);
   afl_free(afl->in_buf);
   afl_free(afl->in_scratch_buf);
@@ -948,6 +945,11 @@ void afl_state_deinit(afl_state_t *afl) {
   ck_free(afl->var_bytes);
   ck_free(afl->top_rated);
   if (afl->vp_frontier) { ck_free(afl->vp_frontier); }
+  if (afl->vp_focus_bitmap) { ck_free(afl->vp_focus_bitmap); }
+  if (afl->vp_focus_prev) { ck_free(afl->vp_focus_prev); }
+  if (afl->vp_focus_relevant) { ck_free(afl->vp_focus_relevant); }
+  if (afl->vp_site_idle) { ck_free(afl->vp_site_idle); }
+  if (afl->vp_site_owned) { ck_free(afl->vp_site_owned); }
 
   ck_free(afl->clean_trace);
   ck_free(afl->clean_trace_custom);
@@ -978,49 +980,6 @@ void afl_state_deinit(afl_state_t *afl) {
   ck_free(afl->havoc_prof);
 
   ck_free(afl->afl_env.afl_forksrv_supl_gids);
-
-  list_remove(&afl_states, afl);
-
-}
-
-void afl_states_stop(void) {
-
-  /* We may be inside a signal handler.
-   Set flags first, send kill signals to child processes later. */
-  LIST_FOREACH(&afl_states, afl_state_t, {
-
-    el->stop_soon = 1;
-
-  });
-
-  LIST_FOREACH(&afl_states, afl_state_t, {
-
-    /* NOTE: We need to make sure that the parent (the forkserver) reap the
-     * child (see below). */
-    if (el->fsrv.child_pid > 0)
-      kill(el->fsrv.child_pid, el->fsrv.child_kill_signal);
-    if (el->fsrv.fsrv_pid > 0) {
-
-      kill(el->fsrv.fsrv_pid, el->fsrv.fsrv_kill_signal);
-      usleep(100);
-      /* Make sure the forkserver does not end up as zombie. */
-      waitpid(el->fsrv.fsrv_pid, NULL, WNOHANG);
-
-    }
-
-  });
-
-}
-
-void afl_states_clear_screen(void) {
-
-  LIST_FOREACH(&afl_states, afl_state_t, { el->clear_screen = 1; });
-
-}
-
-void afl_states_request_skip(void) {
-
-  LIST_FOREACH(&afl_states, afl_state_t, { el->skip_requested = 1; });
 
 }
 

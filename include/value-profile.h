@@ -49,6 +49,12 @@
 /* Max real VP distance is 256; 257 means no candidate for this site. */
 #define VP_DIST_UNSOLVED 257U
 
+#define VP_FILTER_OFF 0U
+#define VP_FILTER_STRICT 1U
+#define VP_FILTER_FOCUS 2U
+
+#define VP_SITE_RETIRED 1U
+
 typedef struct {
 
   u16 best_dist;    /* Best distance for this physical-site slot            */
@@ -61,7 +67,7 @@ typedef struct {
   u16       hit_count;          /* Next wrapping per-exec hit ordinal       */
   u16       touched_mask;       /* Per-exec slots updated this execution    */
   vp_slot_t slots[VP_SLOTS];    /* Per-physical-site best distances         */
-  u32       abi_padding;        /* Keep the site stride fixed across ABIs   */
+  u32       flags;              /* VP_SITE_* bits; keeps the stride fixed   */
 
 } vp_site_t;
 
@@ -69,7 +75,7 @@ typedef struct {
 
   u64 exec_id;               /* Monotonic execution epoch                   */
   u8  enabled;               /* Runtime collection enabled for this exec    */
-  u8  filter_enabled;        /* Restrict recording to filter_bitmap sites   */
+  u8  filter_mode;           /* VP_FILTER_*: recording restriction in force */
   u32 control_len;           /* Number of valid site ids in control[]       */
   u64 filter_bitmap[VP_MAP_W / 64U]; /* Optional per-exec site allowlist      */
   u16 control[VP_CONTROL_CAP];  /* Site ids with at least one slot update     */
@@ -112,6 +118,8 @@ static inline u32 vp_token_tag(u64 token) {
 
 }
 
+/* Plain accesses are enough: the map is shared between the fuzzer and one
+   forked child at a time, never written concurrently. */
 static inline u32 vp_map_find_in_set(const vp_map_t *map, u32 set,
                                      u32 preferred_way, u32 tag) {
 
@@ -119,8 +127,7 @@ static inline u32 vp_map_find_in_set(const vp_map_t *map, u32 set,
   for (u32 i = 0; i < VP_MAP_A; ++i) {
 
     u32 key = base + ((preferred_way + i) & (VP_MAP_A - 1U));
-    if (__atomic_load_n(&map->site_ids[key], __ATOMIC_RELAXED) == tag)
-      return key;
+    if (map->site_ids[key] == tag) return key;
 
   }
 
@@ -135,11 +142,15 @@ static inline u32 vp_map_claim_in_set(vp_map_t *map, u32 set, u32 preferred_way,
   for (u32 i = 0; i < VP_MAP_A; ++i) {
 
     u32 key = base + ((preferred_way + i) & (VP_MAP_A - 1U));
-    u32 expected = 0;
-    if (__atomic_compare_exchange_n(&map->site_ids[key], &expected, tag, 0,
-                                    __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+    u32 cur = map->site_ids[key];
+    if (!cur) {
+
+      map->site_ids[key] = tag;
       return key;
-    if (expected == tag) return key;
+
+    }
+
+    if (cur == tag) return key;
 
   }
 
