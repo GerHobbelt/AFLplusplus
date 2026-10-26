@@ -326,6 +326,17 @@ else
 	LDFLAGS += -Wno-deprecated-declarations
 endif
 
+# macOS is deliberately moved off SysV shared memory even though shmat() works
+# there: kern.sysv.shmseg caps a process at 8 segments by default, and a
+# segment can no longer be attached once it is marked for destruction, so a
+# SIGKILLed tool leaks it. POSIX shared memory handed to the target as an
+# inherited descriptor (see SHM_FD_ENV_VAR) has neither problem.
+ifeq "$(SYS)" "Darwin"
+	SHMAT_OK=0
+	override CFLAGS += -DUSEMMAP=1
+	LDFLAGS += -Wno-deprecated-declarations
+endif
+
 ifdef TEST_MMAP
 	SHMAT_OK=0
 	override CFLAGS += -DUSEMMAP=1
@@ -356,9 +367,11 @@ endif
 	@echo
 
 .PHONY: llvm
-llvm:
+llvm: afl-showmap
 	-$(MAKE) -j$(nproc) -f GNUmakefile.llvm
 	@test -e afl-cc || { echo "[-] Compiling afl-cc failed. You seem not to have a working compiler." ; exit 1; }
+
+afl-cc: llvm
 
 llvm-build-test:
 	$(MAKE) -j$(nproc) -f GNUmakefile.llvm
@@ -525,6 +538,9 @@ afl-cmin: src/afl-cmin.c src/afl-common.o src/afl-sharedmem.o src/afl-forkserver
 ifdef IS_IOS
 	@ldid -Sentitlements.plist $@ && echo "[+] Signed $@" || { echo "[-] Failed to sign $@"; }
 endif
+
+afl-merge: afl-cmin
+	ln -sf afl-cmin $@
 
 afl-tmin: src/afl-tmin.c src/afl-common.o src/afl-sharedmem.o src/afl-forkserver.o src/afl-performance.o src/afl-fuzz-python.o src/afl-fuzz-mutators.o $(COMM_HDR) | test_x86
 	$(CC) $(CFLAGS) $(COMPILE_STATIC) $(CFLAGS_FLTO) $(SPECIAL_PERFORMANCE) src/$@.c src/afl-common.o src/afl-sharedmem.o src/afl-forkserver.o src/afl-performance.o src/afl-fuzz-python.o src/afl-fuzz-mutators.o -o $@ $(PYFLAGS) $(LDFLAGS)
@@ -976,6 +992,7 @@ endif
 	cp -r testcases/ $${DESTDIR}$(MISC_PATH)
 	cp -r dictionaries/ $${DESTDIR}$(MISC_PATH)
 	cp injections.dic $${DESTDIR}$(MISC_PATH)
+	@test -e $${DESTDIR}$(BIN_PATH)/afl-clang-fast || echo "[!] WARNING: LLVM mode was not installed, afl-clang-fast/afl-clang-fast++ are missing! Install llvm and clang 16+ (or set LLVM_CONFIG), rebuild and install again, see docs/INSTALL.md"
 
 .PHONY: uninstall
 uninstall:

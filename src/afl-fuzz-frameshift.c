@@ -48,13 +48,12 @@ int rel_on_insert(fs_relation_t *rel, u64 idx, u64 size) {
   // Check if we should update the value of the field.
   if (idx >= rel->anchor && idx <= rel->insert) {
 
-    u64 pre = rel->val;
+    u64 max = rel->size < 8 ? (1ULL << (rel->size * 8)) - 1 : UINT64_MAX;
+
+    // Check before adding: masking first misses increments that wrap by a
+    // complete field width, such as adding 256 to an 8-bit length.
+    if (size > max - rel->val) { return 1; }
     rel->val += size;
-
-    if (rel->size < 8) { rel->val &= (1ULL << (rel->size * 8)) - 1; }
-
-    // Check if we overflowed the field.
-    if (rel->val < pre) { return 1; }
 
   }
 
@@ -376,13 +375,18 @@ u8 lightweight_run(afl_state_t *afl, u8 *out_buf, u32 len) {
 
   }
 
-  u64 remaining = afl->frameshift_deadline - now;
-  u32 timeout = afl->fsrv.exec_tmout;
-  if (!timeout || remaining < timeout) { timeout = (u32)remaining; }
+  /* The stage deadline bounds how long frameshift may keep going, not how
+     long the target is allowed to take. Cutting an execution short at the
+     remaining budget makes a target that runs in milliseconds return
+     FSRV_RUN_TMOUT, and save_if_interesting() then files the input as a hang.
+     Run with the timeout the user asked for and let the deadline checks above
+     and below end the stage - the overrun is one execution, as in every other
+     stage. */
 
   afl->fs_stats.search_tests++;
 
-  fsrv_run_result_t fault = fuzz_run_target(afl, &afl->fsrv, timeout);
+  fsrv_run_result_t fault =
+      fuzz_run_target(afl, &afl->fsrv, afl->fsrv.exec_tmout);
 
   afl->queued_discovered += save_if_interesting(afl, out_buf, written, fault);
 
@@ -451,6 +455,17 @@ u64 decode_value(u8 *buf, u8 size, u8 le) {
   }
 
   return val;
+
+}
+
+// Pick a shift amount that tests the given field size without overflowing
+// the field itself.
+u64 frameshift_shift_amount(u8 size, u64 curr_size) {
+
+  u64 field_max = size < 8 ? (1ULL << (size * 8)) - 1 : UINT64_MAX;
+  if (curr_size >= field_max) { return 0; }
+
+  return MIN(size == 1 ? (u64)0x20 : (u64)0xff, field_max - curr_size);
 
 }
 
@@ -599,7 +614,12 @@ void frameshift_stage(afl_state_t *afl) {
       frameshift_slice_budget(afl->fs_stats.total_time_ms, allowed_ms);
   if (!budget_ms) { return; }
 
-  afl->frameshift_deadline = time_start + FRAMESHIFT_TIME_BUDGET_MS;
+  afl->stage_name = "frameshift";
+  afl->stage_short = "frameshift";
+  afl->stage_cur_byte = -1;
+  afl->stage_cur_val = 0;
+
+  afl->frameshift_deadline = time_start + budget_ms;
   u32 *inflection_points = NULL;
   u32 *loss_buffer = NULL;
   u8  *repeat_buffer = NULL;
@@ -773,15 +793,8 @@ void frameshift_stage(afl_state_t *afl) {
         // Does this look like a size/offset field?
         if (curr_size == 0 || curr_size > len) { continue; }
 
-        // Pick a shift amount that will test this field size.
-        u64 shift_amount = 0xff;  // overflow the field boundary
-        if (size == 1) {
-
-          u64 max_shift = 0xff - curr_size;
-          if (max_shift == 0) { continue; }
-          shift_amount = MIN((u64)0x20, max_shift);
-
-        }
+        u64 shift_amount = frameshift_shift_amount(size, curr_size);
+        if (!shift_amount) { continue; }
 
         // Check if the field is blocked.
         if (is_blocked(meta, field_pos, size)) {

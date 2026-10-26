@@ -776,13 +776,13 @@ static void afl_fauxsrv_execv(afl_forkserver_t *fsrv, char **argv) {
 
     // Wait for parent by reading from the pipe. Exit if read fails
 
-    if (read(FORKSRV_FD, &was_killed, 4) != 4) { exit(0); }
+    if (read(FORKSRV_FD, &was_killed, 4) != 4) { _exit(0); }
 
     // Create a clone of our process
 
     child_pid = fork();
 
-    if (child_pid < 0) { PFATAL("Fork failed"); }
+    if (child_pid < 0) { PCFATAL("Fork failed"); }
 
     // In child process: close fds, resume execution
 
@@ -820,7 +820,7 @@ static void afl_fauxsrv_execv(afl_forkserver_t *fsrv, char **argv) {
 
         if (setgid(fsrv->gid) == -1) {
 
-          FATAL("setgid failed: %s\n", strerror(errno));
+          CFATAL("setgid failed: %s\n", strerror(errno));
 
         }
 
@@ -830,7 +830,7 @@ static void afl_fauxsrv_execv(afl_forkserver_t *fsrv, char **argv) {
 
         if (setuid(fsrv->uid) == -1) {
 
-          FATAL("setuid failed: %s\n", strerror(errno));
+          CFATAL("setuid failed: %s\n", strerror(errno));
 
         }
 
@@ -851,7 +851,7 @@ static void afl_fauxsrv_execv(afl_forkserver_t *fsrv, char **argv) {
 
     // In parent process: write PID to AFL
 
-    if (write(FORKSRV_FD + 1, &child_pid, 4) != 4) { exit(0); }
+    if (write(FORKSRV_FD + 1, &child_pid, 4) != 4) { _exit(0); }
 
     // after child exited, get and relay exit status to parent through waitpid
 
@@ -864,7 +864,7 @@ static void afl_fauxsrv_execv(afl_forkserver_t *fsrv, char **argv) {
 
     // Relay wait status to AFL pipe, then loop back
 
-    if (write(FORKSRV_FD + 1, &status, 4) != 4) { exit(1); }
+    if (write(FORKSRV_FD + 1, &status, 4) != 4) { _exit(1); }
 
   }
 
@@ -891,7 +891,13 @@ static void report_error_and_exit(int error) {
           "AFL_LLVM_MAP_ADDR or recompile with afl-clang-fast.");
       break;
     case FS_ERROR_SHM_OPEN:
-      FATAL("the fuzzing target reports that the shm_open() call failed.");
+      FATAL(
+          "the fuzzing target reports that the shm_open() call failed. The "
+          "shared maps are handed to the target as inherited file descriptors "
+          "and their name is unlinked right away, so this most likely means "
+          "the target was built with an afl-cc that predates that (recompile "
+          "it, or set AFL_SHM_KEEP_NAME=1 to keep the name around) or that it "
+          "closes all file descriptors on startup.");
       break;
     case FS_ERROR_SHMAT:
       FATAL("the fuzzing target reports that the shmat() call failed.");
@@ -1295,15 +1301,35 @@ void afl_fsrv_start(afl_forkserver_t *fsrv, char **argv,
 
     if (!fsrv->cmplog_binary) {
 
-      unsetenv(CMPLOG_SHM_ENV_VAR);  // we do not want that in non-cmplog fsrv
+      // we do not want that in non-cmplog fsrv - neither the variables nor
+      // the inherited descriptor the cmplog map is handed over on. Only
+      // descriptors inside the reserved range can be ours, so anything else
+      // is left alone rather than risking a close() of an unrelated one.
+      char *cmplog_fd = getenv(CMPLOG_SHM_FD_ENV_VAR);
+      int   cmplog_fd_num = cmplog_fd && *cmplog_fd ? atoi(cmplog_fd) : -1;
+
+      if (cmplog_fd_num >= SHM_FD_MIN) { close(cmplog_fd_num); }
+      unsetenv(CMPLOG_SHM_ENV_VAR);
+      unsetenv(CMPLOG_SHM_FD_ENV_VAR);
 
     }
 
     /* Umpf. On OpenBSD, the default fd limit for root users is set to
-       soft 128. Let's try to fix that... */
-    if (!getrlimit(RLIMIT_NOFILE, &r) && r.rlim_cur < FORKSRV_FD + 2) {
+       soft 128. Let's try to fix that... The floor covers the forkserver
+       pipes on FORKSRV_FD / FORKSRV_FD + 1 as well as the SHM_FD_MIN range
+       the shared maps are handed over on (see SHM_FD_ENV_VAR). */
+    if (!getrlimit(RLIMIT_NOFILE, &r) &&
+        r.rlim_cur < (rlim_t)(SHM_FD_MIN + SHM_FD_COUNT)) {
 
-      r.rlim_cur = FORKSRV_FD + 2;
+      r.rlim_cur = (rlim_t)(SHM_FD_MIN + SHM_FD_COUNT);
+      // asking for more than the hard limit would fail outright and leave the
+      // soft limit where it was, below even the forkserver pipes
+      if (r.rlim_max != RLIM_INFINITY && r.rlim_cur > r.rlim_max) {
+
+        r.rlim_cur = r.rlim_max;
+
+      }
+
       setrlimit(RLIMIT_NOFILE, &r);  // Ignore errors
 
     }
@@ -1378,8 +1404,8 @@ void afl_fsrv_start(afl_forkserver_t *fsrv, char **argv,
 
     // Set up control and status pipes, close the unneeded original fds
 
-    if (dup2(ctl_pipe[0], FORKSRV_FD) < 0) { PFATAL("dup2() failed"); }
-    if (dup2(st_pipe[1], FORKSRV_FD + 1) < 0) { PFATAL("dup2() failed"); }
+    if (dup2(ctl_pipe[0], FORKSRV_FD) < 0) { PCFATAL("dup2() failed"); }
+    if (dup2(st_pipe[1], FORKSRV_FD + 1) < 0) { PCFATAL("dup2() failed"); }
 
     close(ctl_pipe[0]);
     close(ctl_pipe[1]);
@@ -1426,7 +1452,7 @@ void afl_fsrv_start(afl_forkserver_t *fsrv, char **argv,
        falling through. */
 
     *(u32 *)fsrv->trace_bits = EXEC_FAIL_SIG;
-    FATAL("Error: execv to target failed\n");
+    CFATAL("Error: execv to target failed\n");
 
   }
 

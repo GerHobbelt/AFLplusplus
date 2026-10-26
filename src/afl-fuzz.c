@@ -130,7 +130,11 @@ extern u64 time_spent_working;
 
 static void at_exit() {
 
-  s32   i, pid1 = 0, pid2 = 0, pgrp = -1;
+  s32 i, pid1 = 0, pid2 = 0, pgrp = -1;
+  /* Backstop for a shared map that afl_shm_deinit_all() could not reach. On
+     USEMMAP builds the maps are normally already unlinked at creation and
+     only reachable through the inherited descriptor, so these unlinks are
+     expected to be no-ops - they still matter with AFL_SHM_KEEP_NAME. */
   char *list[5] = {SHM_ENV_VAR, SHM_FUZZ_ENV_VAR, CMPLOG_SHM_ENV_VAR,
                    VP_SHM_ENV_VAR, NULL};
   char *ptr;
@@ -3526,6 +3530,29 @@ void afl_load_seeds(afl_state_t *afl) {
     } else {
 
       ACTF("Skipping initial seed calibration due option override!");
+
+      /* Some modes start the forkserver during calibration rather than map
+         size detection. Skipping calibration must not skip that setup. */
+
+      if (!afl->fsrv.fsrv_pid) {
+
+        u8 vp_env_armed = vp_env_arm(afl);
+        afl_fsrv_start(&afl->fsrv, afl->argv, &afl->stop_soon,
+                       afl->afl_env.afl_debug_child);
+        if (vp_env_armed) { vp_env_disarm(); }
+
+      }
+
+      if (afl->fsrv.support_shmem_fuzz && !afl->fsrv.use_shmem_fuzz) {
+
+        afl_shm_deinit(afl->shm_fuzz);
+        ck_free(afl->shm_fuzz);
+        afl->shm_fuzz = NULL;
+        afl->fsrv.support_shmem_fuzz = 0;
+        afl->fsrv.shmem_fuzz = NULL;
+
+      }
+
       usleep(1000);
 
     }

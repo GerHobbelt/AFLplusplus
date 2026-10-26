@@ -2544,10 +2544,51 @@ void add_runtime(aflcc_state_t *aflcc) {
   #if defined(__APPLE__)
     if (aflcc->shared_linking || aflcc->partial_linking) {
 
-      insert_param(aflcc, "-Wl,-U");
-      insert_param(aflcc, "-Wl,___afl_area_ptr");
-      insert_param(aflcc, "-Wl,-U");
-      insert_param(aflcc, "-Wl,___sanitizer_cov_trace_pc_guard_init");
+      /* An instrumented shared object references the AFL runtime symbols
+         (coverage and value-profile hooks) but does not link the runtime
+         itself - those bind to the main executable's afl-compiler-rt.o at load
+         time. Unlike ELF, Mach-O rejects undefined symbols in a dylib unless
+         each is explicitly marked, so allow the ones instrumentation emits. */
+      static const char *apple_rt_undef_syms[] = {
+
+          "-Wl,___afl_area_ptr",
+          "-Wl,___sanitizer_cov_trace_pc_guard_init",
+          "-Wl,___afl_vp_enabled_ptr",
+          "-Wl,___afl_vp_switch_cases",
+          "-Wl,___valueprofile_hook1",
+          "-Wl,___valueprofile_hook2",
+          "-Wl,___valueprofile_hook4",
+          "-Wl,___valueprofile_hook8",
+          "-Wl,___valueprofile_hook16",
+          "-Wl,___valueprofile_hookN",
+          "-Wl,___valueprofile_hook_float",
+          "-Wl,___valueprofile_hook_double",
+          "-Wl,___valueprofile_switch",
+          "-Wl,___valueprofile_rtn_hook",
+          "-Wl,___valueprofile_rtn_hook_n",
+          "-Wl,___valueprofile_rtn_hook_str",
+          "-Wl,___valueprofile_rtn_hook_str_ci",
+          "-Wl,___valueprofile_rtn_hook_strn",
+          "-Wl,___valueprofile_rtn_hook_strn_ci",
+          "-Wl,___valueprofile_rtn_hook_sub",
+          "-Wl,___valueprofile_rtn_hook_sub_ci",
+          "-Wl,___valueprofile_rtn_hook_sub_hn",
+          "-Wl,___valueprofile_rtn_hook_sub_n",
+          "-Wl,___valueprofile_rtn_gcc_stdstring_cstring",
+          "-Wl,___valueprofile_rtn_gcc_stdstring_stdstring",
+          "-Wl,___valueprofile_rtn_llvm_stdstring_cstring",
+          "-Wl,___valueprofile_rtn_llvm_stdstring_stdstring",
+
+      };
+
+      for (u32 i = 0;
+           i < sizeof(apple_rt_undef_syms) / sizeof(*apple_rt_undef_syms);
+           ++i) {
+
+        insert_param(aflcc, "-Wl,-U");
+        insert_param(aflcc, (u8 *)apple_rt_undef_syms[i]);
+
+      }
 
     }
 
@@ -2556,6 +2597,13 @@ void add_runtime(aflcc_state_t *aflcc) {
        the symbol may be missing at runtime. */
     insert_param(aflcc, "-Wl,-U");
     insert_param(aflcc, "-Wl,___asan_region_is_poisoned");
+
+    #ifdef __AFL_CODE_COVERAGE
+    /* Same for the sanitizer runtime symbol AFL_PC_FILTER resolves through -
+       a target that is not built with a sanitizer simply does not have it. */
+    insert_param(aflcc, "-Wl,-U");
+    insert_param(aflcc, "-Wl,___sanitizer_symbolize_pc");
+    #endif
 
   #endif
 
@@ -2788,7 +2836,7 @@ param_st parse_misc_params(aflcc_state_t *aflcc, u8 *cur_argv, u8 scan) {
 
   } else if (!strncmp(cur_argv, "-fcf-protection", strlen("-fcf-protection"))) {
 
-    SCAN_KEEP(aflcc->have_cfisan, 1);
+    SCAN_KEEP(aflcc->have_fcf, 1);
 
   } else if (!strncmp(cur_argv, "-O", 2)) {
 

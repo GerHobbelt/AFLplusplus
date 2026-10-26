@@ -3,13 +3,30 @@
   This is the list of all noteworthy changes made in every public
   release of the tool. See README.md for the general instruction manual.
 
-### Version ++5.03a (dev)
+### Version ++5.04a (dev)
+  - afl-fuzz
+    - frameshift timeout fix (fixes spurious timeouts that can occur, especially
+      with persistent loop counts of 1
+  - afl-cc
+    - a plain `-fcf-protection` (part of the default hardened CFLAGS on
+      Fedora/RHEL) was mistaken for `AFL_USE_CFISAN` and injected `-flto`,
+      which silently disabled PCGUARD instrumentation for the target
+
+
+### Version ++5.03c (release)
   ! Value Profile implementation for AFL++ by Khaled Yakdan (@kyakdan) that
     is much more efficient and intelligent than the libfuzzer implementation.
     Enable in the fuzz target with `AFL_LLVM_VALUE_PROFILE=1` and enable for
     afl-fuzz with `-r <seconds>` when to activate (default off)
-  - afl-fuzz
+  ! macOS now uses POSIX shared memory instead of SysV, which lifts the
+    `kern.sysv.shmseg` / `kern.sysv.shmmax` ceilings (CmpLog alone needs a
+    145 MB segment, far past the 4 MB macOS default). !!! You need to
+    recompile your targets on macOS - a target built by an older afl-cc still
+    expects a SysV id in `__AFL_SHM_ID` !!!
+  afl-fuzz
     - big change: limits before switching modes is not time based but exec based now.
+    - fix: shmem leakage on target timeouts and crashes - this has been the case
+      since vanilla AFL. Now fixed for Linux, MacOS and mmap targets.
     - for more variability, a "starved" mode is implemented now. If for a longer
       time no finds are found, then more seed and mutation variability is
       introduced incl. splicing phase enabled. This is visible in the UI.
@@ -61,6 +78,7 @@
     - removed the obsolete afl-as assembler wrapper and its remaining references
     - headers shipped in a source checkout are found in `include/` now, an
       in-tree build silently preferred an older installed copy before
+    - fix: `CODE_COVERAGE=1` builds
     - IJON: the map expansion is re-applied after a guard-init reset, so a
       target whose coverage is split over several instrumented modules gets
       the full map; the IJON channels also stay live under a tool that
@@ -75,6 +93,9 @@
     - afl-cmin.c is now the default afl-cmin, but it needed a larger rewrite
     - `-T all` (C and python variants) now counts the CPUs the process is
       actually allowed to run on (like `nproc` does)
+    - fix: afl-cmin.c asked afl_shm_init() to chown the shared maps to gid 0,
+      which aborted with `fchown() failed` on POSIX shared memory. No tool
+      wants a chown here, so it now passes -1 like all the others do.
   - afl-showmap:
     - `-i` now follows symlinked test cases and symlinked subdirectories
     - a child killed by a signal no longer reports a garbage exit code in
@@ -85,10 +106,14 @@
     - the IJON max-value slots and a bug-pass map are no longer counted as
       coverage: they hold wide values, not hit counts, and were reported as
       tuples, minimised against and bucket-classified in place
+    - fix: releaseshared memory when aborted
   - afl-health
     - more speed, more info, a few fixes
   - custom_mutators:
     - removed outdated and pointless radamsa
+  - frida_mode:
+    - fix arm64 inline coverage ADRP fixups when instrumentation suppression is
+      disabled
 
 
 ### Version ++5.02c (release)
@@ -132,7 +157,7 @@
 ### Version ++5.01c (release)
   - MacOS persistent mode now uses futex mode now too which increases speed
     and reduces system call overhead (opt out with AFL_FAST_CHILD_SYNC) - this
-    requires a MacOS from 2024 onwards.
+    requires a MacOS from 2024 onwards (Sonoma 14.4+).
   - afl-fuzz
     - new adaptive MOpt! Much better than the outdated one we still had.
       How good it is still needs to be seen but initially it seems to be
