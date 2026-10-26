@@ -21,6 +21,8 @@
 
      https://www.apache.org/licenses/LICENSE-2.0
 
+   SPDX-License-Identifier: Apache-2.0
+
    Shared code that implements a forkserver. This is used by the fuzzer
    as well the other components like afl-tmin.
 
@@ -575,8 +577,7 @@ void afl_fsrv_init_dup(afl_forkserver_t *fsrv_to, afl_forkserver_t *from) {
   fsrv_to->child_kill_signal = from->child_kill_signal;
   fsrv_to->fsrv_kill_signal = from->fsrv_kill_signal;
   fsrv_to->debug = from->debug;
-  fsrv_to->cmplog_size_derive_requested =
-      from->cmplog_size_derive_requested;
+  fsrv_to->cmplog_size_derive_requested = from->cmplog_size_derive_requested;
   fsrv_to->supports_allocsize_derive = false;
 
 #ifdef __AFL_CODE_COVERAGE
@@ -712,6 +713,47 @@ restart_poll:
   return 0;  // not reached
 
 }
+
+/* Read child_status from the forkserver pipe after a timeout, escalating
+   to SIGKILL if the configured child_kill_signal failed to terminate the
+   child within FORKSRV_KILL_GRACE_MS. child_kill_signal defaults to
+   SIGTERM in persistent mode; targets that catch or defer it (e.g.,
+   CPython delivers signals only between bytecodes, so a target stuck in
+   a long-running C function such as bignum multiplication never sees the
+   signal) would otherwise leave the forkserver wedged in waitpid() and
+   the fuzzer wedged in this read forever. SIGKILL is delivered by the
+   kernel regardless of target state, so it always unsticks waitpid().
+
+   Returns 1 on success, 0 if *stop_soon_p was raised.
+   Hard pipe errors abort via RPFATAL. */
+#define FORKSRV_KILL_GRACE_MS 1000U
+#ifdef __linux__
+static inline u8 read_status_or_escalate(afl_forkserver_t *fsrv,
+                                         volatile u8      *stop_soon_p) {
+
+  s32 res = -1;
+  u32 read_ms = read_s32_timed(fsrv->fsrv_st_fd, &fsrv->child_status,
+                               FORKSRV_KILL_GRACE_MS, stop_soon_p);
+
+  if (likely(read_ms > 0 && read_ms <= FORKSRV_KILL_GRACE_MS)) { return 1; }
+
+  if (read_ms > FORKSRV_KILL_GRACE_MS) {
+
+    if (fsrv->child_pid > 0) { kill(fsrv->child_pid, SIGKILL); }
+    if ((res = read(fsrv->fsrv_st_fd, &fsrv->child_status, 4)) == 4) {
+
+      return 1;
+
+    }
+
+  }
+
+  if (*stop_soon_p) { return 0; }
+  RPFATAL(res, "Unable to communicate with fork server");
+
+}
+
+#endif
 
 /* Internal forkserver for non_instrumented_mode=1 and non-forkserver mode runs.
   It execvs for each fork, forwarding exit codes and child pids to afl. */
@@ -1564,8 +1606,10 @@ void afl_fsrv_start(afl_forkserver_t *fsrv, char **argv,
           !fsrv->supports_allocsize_derive) {
 
         FATAL(
-            "-l Z requires a CmpLog target compiled with "
-            "AFL_LLVM_BUG_ALLOCSIZE_DERIVE=1");
+            "-l z (size-derive) requested but target does not announce "
+            "ALLOCSIZE_DERIVE support. Rebuild the target with "
+            "AFL_LLVM_BUG_ALLOCSIZE_DERIVE=1 (note: AFL_USE_ASAN disables "
+            "ALLOCSIZE/DERIVE).");
 
       }
 
@@ -1593,6 +1637,16 @@ void afl_fsrv_start(afl_forkserver_t *fsrv, char **argv,
 
         fsrv->use_ijon = 1;
         if (!be_quiet) { ACTF("Using IJON feature."); }
+
+      }
+
+      /* Target reports an appended bug-pass map; configure_bug_runtime
+         in afl-fuzz.c subtracts MAP_SIZE_BUG_BYTES from fsrv->map_size
+         before the coverage code touches that region. */
+      if (status & FS_NEW_OPT_BUG_MAP) {
+
+        fsrv->use_bug_map = 1;
+        if (!be_quiet) { ACTF("Bug-pass map detected in target."); }
 
       }
 
@@ -1707,9 +1761,10 @@ void afl_fsrv_start(afl_forkserver_t *fsrv, char **argv,
 
         if (fsrv->cmplog_size_derive_requested) {
 
-          FATAL(
-              "-l Z requires a CmpLog target with new forkserver support and "
-              "AFL_LLVM_BUG_ALLOCSIZE_DERIVE=1");
+          WARNF(
+              "-l z (size-derive) requested but target uses the old forkserver "
+              "protocol — ignored");
+          fsrv->cmplog_size_derive_requested = false;
 
         }
 
@@ -2617,12 +2672,7 @@ fsrv_run_result_t __attribute__((hot)) afl_fsrv_run_target(
 
     /* EXITED or timeout/stop: read child status from forkserver pipe. */
   futex_read_status:
-    if ((res = read(fsrv->fsrv_st_fd, &fsrv->child_status, 4)) < 4) {
-
-      if (*stop_soon_p) { return 0; }
-      RPFATAL(res, "Unable to communicate with fork server");
-
-    }
+    if (!read_status_or_escalate(fsrv, stop_soon_p)) { return 0; }
 
     fsrv->child_pid = -1;
     __atomic_store_n(fsrv->child_sync, AFL_CHILD_IDLE, __ATOMIC_RELEASE);
@@ -2714,12 +2764,7 @@ fsrv_run_result_t __attribute__((hot)) afl_fsrv_run_target(
     }
 
     /* EXITED or timeout/stop: read child status from forkserver pipe. */
-    if ((res = read(fsrv->fsrv_st_fd, &fsrv->child_status, 4)) < 4) {
-
-      if (*stop_soon_p) { return 0; }
-      RPFATAL(res, "Unable to communicate with fork server");
-
-    }
+    if (!read_status_or_escalate(fsrv, stop_soon_p)) { return 0; }
 
     fsrv->child_pid = -1;
     __atomic_store_n(fsrv->child_sync, AFL_CHILD_IDLE, __ATOMIC_RELEASE);
@@ -2929,3 +2974,4 @@ void afl_fsrv_deinit(afl_forkserver_t *fsrv) {
   list_remove(&fsrv_list, fsrv);
 
 }
+

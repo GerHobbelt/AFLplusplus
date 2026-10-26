@@ -1,23 +1,15 @@
-// test/test-bug-sizefill-inout.c
-//
-// Exercises in/out semantics on a SIZEFILL out-size parameter. The
-// callee passes the out-pointer to a helper that READS through it
-// (escape — the pass can't see what the helper does, must assume
-// in/out). With the conservative escape-aware in/out detection, the
-// pass skips Bug 2's pre-call zero so the caller's initial hint
-// survives.
-//
-// Verification: the helper prints the hint it observed. With the fix,
-// the print shows the caller's initial value (0x12345678). Without
-// the fix, the pre-zero clobbers it to 0.
+// SIZEFILL in/out semantics: when the callee passes the out-pointer
+// to a helper that READS through it (escape), the pass must treat the
+// parameter as in/out and skip its pre-call zero so the caller's
+// initial hint survives.  The helper prints the hint it observed —
+// with the fix it shows 0x12345678, without it shows 0.
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <stddef.h>
 
-__attribute__((noinline, optnone))
-static size_t read_hint(size_t *p) {
+__attribute__((noinline, optnone)) static size_t read_hint(size_t *p) {
 
   // Escape: the pass sees only that `p` is passed to a CallBase; it
   // can't prove the callee doesn't read through it. Must treat the
@@ -26,8 +18,8 @@ static size_t read_hint(size_t *p) {
 
 }
 
-__attribute__((noinline, optnone))
-static void parse(uint8_t *buf, uint32_t n, size_t *inout_size) {
+__attribute__((noinline, optnone)) static void parse(uint8_t *buf, uint32_t n,
+                                                     size_t *inout_size) {
 
   if (buf == NULL) {
 
@@ -44,7 +36,8 @@ static void parse(uint8_t *buf, uint32_t n, size_t *inout_size) {
   size_t hint = read_hint(inout_size);
   fprintf(stderr, "INOUT_HINT_SEEN=%zu\n", hint);
   size_t bytes = (hint < 8) ? hint : 8;
-  for (size_t i = 0; i < bytes; ++i) buf[i] = (uint8_t)(i + n);
+  for (size_t i = 0; i < bytes; ++i)
+    buf[i] = (uint8_t)(i + n);
   *inout_size = bytes;
 
 }
@@ -66,3 +59,4 @@ int main(void) {
   return 0;
 
 }
+

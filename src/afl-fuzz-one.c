@@ -17,6 +17,8 @@
 
      https://www.apache.org/licenses/LICENSE-2.0
 
+   SPDX-License-Identifier: Apache-2.0
+
    This is the real deal: the program takes an instrumented binary and
    attempts a variety of basic fuzzing tricks, paying close attention to
    how they affect the execution path.
@@ -3749,12 +3751,12 @@ abandon_entry:
                !afl->queue_cur->cal_failed && !afl->queue_cur->was_fuzzed &&
                !afl->queue_cur->disabled)) {
 
-    --afl->pending_not_fuzzed;
+    if (likely(afl->pending_not_fuzzed)) { --afl->pending_not_fuzzed; }
     afl->queue_cur->was_fuzzed = 1;
     afl->reinit_table = 1;
     if (afl->queue_cur->favored) {
 
-      --afl->pending_favored;
+      if (likely(afl->pending_favored)) { --afl->pending_favored; }
       afl->smallest_favored = -1;
 
     }

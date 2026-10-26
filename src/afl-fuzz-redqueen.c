@@ -19,6 +19,8 @@
 
      https://www.apache.org/licenses/LICENSE-2.0
 
+   SPDX-License-Identifier: Apache-2.0
+
    Shared code to handle the shared memory. This is used by the fuzzer
    as well the other components like afl-tmin, afl-showmap, etc...
 
@@ -106,7 +108,6 @@ static struct range *add_range(struct range *ranges, u32 start, u32 end) {
   return r;
 
 }
-
 
 static struct range *pop_biggest_range(struct range **ranges) {
 
@@ -2952,19 +2953,20 @@ static u8 rtn_fuzz(afl_state_t *afl, u32 key, u8 *orig_buf, u8 *buf, u8 *cbuf,
 
 }
 
-/* If -l m is active, scan cmp_map for inequality cmps, derive slack from
+/* If -l -M is active, scan cmp_map for inequality cmps, derive slack from
    v0/v1, and track per-site global minima in afl->min_slack. Marks the
    current queue entry as tightness_novel (and favoured) iff a new
    per-site min was achieved. Allocates afl->min_slack lazily on first
    call. */
 static void collect_tightness_minima(afl_state_t *afl) {
 
-  if (!afl->cmplog_tightness || !afl->shm.cmp_map) return;
+  if (likely(!afl->cmplog_tightness)) return;
 
   if (unlikely(!afl->min_slack)) {
 
     afl->min_slack = ck_alloc(sizeof(u64) * CMP_MAP_W);
-    for (u32 i = 0; i < CMP_MAP_W; ++i) afl->min_slack[i] = (u64)-1;
+    for (u32 i = 0; i < CMP_MAP_W; ++i)
+      afl->min_slack[i] = (u64)-1;
 
   }
 
@@ -3004,6 +3006,8 @@ static void collect_tightness_minima(afl_state_t *afl) {
 
     afl->cmplog_tightness_new++;
     afl->queue_cur->tightness_novel = 1;
+    /* Stamp the cycle so cull_queue can decay this flag later. */
+    afl->queue_cur->tightness_novel_cycle = afl->queue_cycle;
     afl->queue_cur->favored = 1;
 
   }
@@ -3369,3 +3373,4 @@ exit_its:
   return r;
 
 }
+

@@ -33,7 +33,7 @@ VERSION     = $(shell grep '^ *$(HASH)define VERSION ' ./config.h | cut -d '"' -
 
 SYS = $(shell uname -s)
 
-override LLVM_TOO_NEW_DEFAULT := 22
+override LLVM_TOO_NEW_DEFAULT := 23
 override LLVM_TOO_OLD_DEFAULT := 14
 
 ifeq "$(SYS)" "OpenBSD"
@@ -70,7 +70,7 @@ endif
 
 LLVM_STDCXX                  := gnu++11
 LLVM_LTO                     := 0
-LLVM_UNSUPPORTED             := $(shell echo "$(LLVMVER)" | grep -E -q '^[0-2]\.|^3\.[0-7]\.|^2[3-9]\.' && echo 1 || echo 0)
+#LLVM_UNSUPPORTED             := $(shell echo "$(LLVMVER)" | grep -E -q '^[0-2]\.|^3\.[0-7]\.|^2[3-9]\.' && echo 1 || echo 0)
 # Uncomment to see the values assigned above
 # $(foreach var,_CLANG_VERSIONS_TO_TEST LLVM_CONFIG LLVMVER LLVM_MAJOR LLVM_MINOR LLVM_TOO_NEW LLVM_TOO_OLD LLVM_TOO_NEW_DEFAULT LLVM_TOO_OLD_DEFAULT LLVM_NEW_API LLVM_NEWER_API LLVM_13_OK LLVM_HAVE_LTO LLVM_BINDIR LLVM_LIBDIR LLVM_STDCXX LLVM_APPLE_XCODE LLVM_LTO LLVM_UNSUPPORTED,$(warning $(var) = $($(var))))
 
@@ -78,16 +78,16 @@ ifeq "$(LLVMVER)" ""
   $(warning [!] llvm_mode needs llvm-config, which was not found. Set LLVM_CONFIG to its path and retry.)
 endif
 
-ifeq "$(LLVM_UNSUPPORTED)" "1"
-  $(error llvm_mode only supports llvm from version 3.8 onwards - or your version is too new. Upgrade AFL++ if possible or downgrade LLVM.)
-endif
+#ifeq "$(LLVM_UNSUPPORTED)" "1"
+#  $(error llvm_mode only supports llvm from version $(LLVM_TOO_OLD_DEFAULT) to $(LLVM_TOO_NEW_DEFAULT) - or your version is too new. Upgrade AFL++ if possible or downgrade LLVM. Your version: $(LLVMVER))
+#endif
 
 ifeq "$(LLVM_TOO_NEW)" "1"
-  $(warning you are using an in-development llvm version - this might break llvm_mode!)
+  $(warning you are using an in-development llvm version - this might break llvm_mode! We only support LLVM version up to $(LLVM_TOO_OLD_DEFAULT), your version: $(LLVMVER))
 endif
 
 ifeq "$(LLVM_TOO_OLD)" "1"
-  $(warning you are using an outdated LLVM version! Please use at least LLVM 13 or newer!)
+  $(warning you are using an outdated LLVM version! Please use at least LLVM $(LLVM_TOO_OLD_DEFAULT) or newer!)
   $(shell sleep 2)
 endif
 
@@ -356,6 +356,11 @@ ifeq "$(SYS)" "OpenBSD"
   LDFLAGS += -lc++abi -lpthread
 endif
 
+# needed for backtrace under FreeBSD
+ifeq "$(SYS)" "FreeBSD"
+  LDFLAGS += -lexecinfo
+endif
+
 ifeq "$(shell echo '$(HASH)include <sys/ipc.h>@$(HASH)include <sys/shm.h>@int main() { int _id = shmget(IPC_PRIVATE, 65536, IPC_CREAT | IPC_EXCL | 0600); shmctl(_id, IPC_RMID, 0); return 0;}' | tr @ '\n' | $(CC) -x c - -o .test2 2>/dev/null && echo 1 || echo 0 ; rm -f .test2 )" "1"
         SHMAT_OK=1
 else
@@ -378,7 +383,7 @@ ifeq "$(LLVMVER)" ""
   NO_BUILD = 1
 endif
 
-ifneq "$(LLVM_UNSUPPORTED)$(LLVM_APPLE_XCODE)" "00"
+ifneq "$(LLVM_TOO_OLD)$(LLVM_APPLE_XCODE)" "00"
   NO_BUILD = 1
 endif
 
@@ -450,26 +455,26 @@ ifdef IS_IOS
 endif
 
 instrumentation/afl-llvm-common.o: instrumentation/afl-llvm-common.cc instrumentation/afl-llvm-common.h
-	$(CXX) $(CFLAGS) $(CPPFLAGS) $$($(LLVM_CONFIG) --cxxflags) -fno-rtti -fPIC -std=$(LLVM_STDCXX) -c $< -o $@
+	$(CXX) $(CFLAGS) $(CXXFLAGS) $(CPPFLAGS) $$($(LLVM_CONFIG) --cxxflags) -fno-rtti -fPIC -std=$(LLVM_STDCXX) -c $< -o $@
 
 ./afl-llvm-pass.so: instrumentation/afl-llvm-pass.so.cc instrumentation/afl-llvm-common.o | test_deps
 ifeq "$(LLVM_MIN_4_0_1)" "0"
 	$(info [!] N-gram branch coverage instrumentation is not available for llvm version $(LLVMVER))
 endif
-	$(CXX) $(CLANG_CPPFL) -Wdeprecated -fno-rtti -fPIC -std=$(LLVM_STDCXX) -shared $< -o $@ $(CLANG_LFL) instrumentation/afl-llvm-common.o
+	$(CXX) $(CLANG_CPPFL) -Wdeprecated -Wno-deprecated-copy-dtor -Wno-deprecated-copy-with-dtor -fno-rtti -fPIC -std=$(LLVM_STDCXX) -shared $< -o $@ $(CLANG_LFL) instrumentation/afl-llvm-common.o
 ifdef IS_IOS
 	@ldid -Sentitlements.plist $@ && echo "[+] Signed $@" || { echo "[-] Failed to sign $@"; }
 endif
 
 ./afl-llvm-ijon-pass.so: instrumentation/afl-llvm-ijon-pass.so.cc instrumentation/afl-llvm-common.o | test_deps
-	$(CXX) $(CLANG_CPPFL) -Wdeprecated -fno-rtti -fPIC -std=$(LLVM_STDCXX) -shared $< -o $@ $(CLANG_LFL) instrumentation/afl-llvm-common.o
+	$(CXX) $(CLANG_CPPFL) -Wdeprecated -Wno-deprecated-copy-dtor -Wno-deprecated-copy-with-dtor -fno-rtti -fPIC -std=$(LLVM_STDCXX) -shared $< -o $@ $(CLANG_LFL) instrumentation/afl-llvm-common.o
 ifdef IS_IOS
 	@ldid -Sentitlements.plist $@ && echo "[+] Signed $@" || { echo "[-] Failed to sign $@"; }
 endif
 
 ./SanitizerCoveragePCGUARD.so: instrumentation/SanitizerCoveragePCGUARD.so.cc instrumentation/afl-llvm-common.o | test_deps
 ifeq "$(LLVM_13_OK)" "1"
-	-$(CXX) $(CLANG_CPPFL) -fno-rtti -fPIC -std=$(LLVM_STDCXX) -shared $< -o $@ $(CLANG_LFL) -Wno-deprecated-copy-dtor -Wdeprecated instrumentation/afl-llvm-common.o
+	-$(CXX) $(CLANG_CPPFL) -fno-rtti -fPIC -std=$(LLVM_STDCXX) -shared $< -o $@ $(CLANG_LFL) -Wdeprecated -Wno-deprecated-copy-dtor -Wno-deprecated-copy-with-dtor instrumentation/afl-llvm-common.o
 ifdef IS_IOS
 	@ldid -Sentitlements.plist $@ && echo "[+] Signed $@" || { echo "[-] Failed to sign $@"; }
 endif
@@ -534,7 +539,7 @@ ifdef IS_IOS
 	@ldid -Sentitlements.plist $@ && echo "[+] Signed $@" || { echo "[-] Failed to sign $@"; }
 endif
 
-./afl-llvm-bug-pass.so:	instrumentation/afl-llvm-bug-pass.cc instrumentation/afl-llvm-common.o | test_deps
+./afl-llvm-bug-pass.so:	instrumentation/afl-llvm-bug-pass.so.cc instrumentation/afl-llvm-common.o | test_deps
 	$(CXX) $(CLANG_CPPFL) -shared $< -o $@ $(CLANG_LFL) instrumentation/afl-llvm-common.o
 ifdef IS_IOS
 	@ldid -Sentitlements.plist $@ && echo "[+] Signed $@" || { echo "[-] Failed to sign $@"; }

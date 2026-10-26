@@ -1,4 +1,17 @@
 /*
+   american fuzzy lop++ - part of the AFL++ project
+   ------------------------------------------------
+
+   Copyright 2019-2026 AFLplusplus Project. All rights reserved.
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may obtain a copy at https://www.apache.org/licenses/LICENSE-2.0
+
+   SPDX-License-Identifier: Apache-2.0
+
+ */
+
+/*
    american fuzzy lop++ - LLVM IJON instrumentation pass
    -----------------------------------------------------
 
@@ -15,7 +28,7 @@
 
 // Include LLVM headers first to avoid macro conflicts
 #include "llvm/Passes/PassBuilder.h"
-#if LLVM_MAJOR >= 22
+#if defined(__has_include) && __has_include("llvm/Plugins/PassPlugin.h")
   #include "llvm/Plugins/PassPlugin.h"
 #else
   #include "llvm/Passes/PassPlugin.h"
@@ -260,6 +273,7 @@ int IJONInstrumentation::instrumentFunction(Function &F) {
 
           if (calledFunc->getName() == "ijon_max" ||
               calledFunc->getName() == "ijon_max_variadic" ||
+              calledFunc->getName() == "ijon_max_until" ||
               calledFunc->getName() == "ijon_set" ||
               calledFunc->getName() == "ijon_inc" ||
               calledFunc->getName() == "ijon_xor_state") {
@@ -336,6 +350,11 @@ int IJONInstrumentation::instrumentFunction(Function &F) {
 
         // For ijon_xor_state, we don't transform - just count and pass through
         ijon_state_calls++;
+
+      } else if (calledFunc->getName() == "ijon_max_until") {
+
+        // Preserve ijon_max_until's encoded max value semantics.
+        ijon_max_calls++;
 
       } else {
 
